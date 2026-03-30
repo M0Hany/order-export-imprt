@@ -1,0 +1,43 @@
+# Render Blueprint: https://render.com/docs/blueprint-spec
+#
+# I cannot log into Render/Neon/GitHub for you — push this repo to GitHub, then:
+# 1) https://neon.tech — create project → copy DATABASE_URL (use pooled + sslmode=require).
+# 2) https://dashboard.render.com → New → Blueprint → connect repo → apply.
+# 3) In Render, add environment variables (see list below). Use your LIVE service URL
+#    for SHOPIFY_APP_URL (e.g. https://orders-export-import.onrender.com).
+# 4) Update shopify.app.toml application_url + redirect_urls to that URL, run:
+#    shopify app deploy
+#
+# Required env vars on Render (Dashboard → your Web Service → Environment):
+#   DATABASE_URL     — from Neon
+#   SHOPIFY_API_KEY  — Partners → app → Client credentials
+#   SHOPIFY_API_SECRET
+#   SCOPES           — write_draft_orders
+#   SHOPIFY_APP_URL  — https://<this-service-name>.onrender.com (no trailing slash)
+#
+# Local dev: set the same variables in .env; use Neon’s connection string or local Postgres.
+
+services:
+  - type: web
+    name: orders-export-import
+    runtime: node
+    plan: free
+    region: oregon
+    buildCommand: npm ci && npx prisma generate && npm run build
+    startCommand: npx prisma migrate deploy && npm run start
+    healthCheckPath: /health
+    envVars:
+      - key: NODE_VERSION
+        value: "22.12.0"
+      - key: NODE_ENV
+        value: production
+      - key: SCOPES
+        value: write_draft_orders
+      - key: DATABASE_URL
+        sync: false
+      - key: SHOPIFY_API_KEY
+        sync: false
+      - key: SHOPIFY_API_SECRET
+        sync: false
+      - key: SHOPIFY_APP_URL
+        sync: false

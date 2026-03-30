@@ -1,0 +1,49 @@
+# Learn more: https://shopify.dev/docs/apps/tools/cli/configuration
+#
+# ─── Production (shopify app deploy) ─────────────────────────────────────────
+# Deploy updates Shopify with the URLs in THIS file. If application_url is still
+# example.com, the embedded app iframe will show "Example Domain".
+#
+# 1. Host the built app on a public HTTPS URL (run `npm run build`, then
+#    `npm run start` behind a process manager, or use Render / Fly.io / Railway / etc.).
+# 2. Set application_url to that origin (no trailing slash), e.g.
+#    https://your-app.onrender.com
+# 3. Set every redirect_urls entry below to use THE SAME host (only the path stays
+#    /auth/callback).
+# 4. Set SHOPIFY_APP_URL in your host environment to the same URL as application_url.
+# 5. Run `shopify app deploy` again, then reinstall or open the app on the store.
+#
+# ─── Local dev (npm run dev) ─────────────────────────────────────────────────
+# The CLI can override the Partner app URL with your tunnel while dev runs
+# (automatically_update_urls_on_dev). After testing locally, fix application_url
+# and redirect_urls for production before deploying, or the store will load the wrong host.
+
+client_id = "77108b12886ef9742eb033c9c85defae"
+name = "Orders Export Import"
+application_url = "https://example.com"
+embedded = true
+
+[build]
+automatically_update_urls_on_dev = true
+include_config_on_deploy = true
+
+[webhooks]
+api_version = "2026-01"
+
+  [[webhooks.subscriptions]]
+  topics = [ "app/uninstalled" ]
+  uri = "/webhooks/app/uninstalled"
+
+  [[webhooks.subscriptions]]
+  topics = [ "app/scopes_update" ]
+  uri = "/webhooks/app/scopes_update"
+
+[access_scopes]
+scopes = "write_draft_orders"
+optional_scopes = [ ]
+use_legacy_install_flow = false
+
+[auth]
+redirect_urls = [
+  "https://example.com/auth/callback",
+]
