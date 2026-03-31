@@ -17,6 +17,8 @@ type ImportedOrderRow = {
   sourceName: string | null;
   sourceId: string | null;
   importedAt: string;
+  createdAt?: string | null;
+  trackedByApp?: boolean;
 };
 
 type ActionResult = {
@@ -122,23 +124,68 @@ async function listImportedOrderGidsFromShopify(admin: AdminApiContext) {
   return ids;
 }
 
-export const loader = async ({ request }: LoaderFunctionArgs) => {
-  const { session } = await authenticate.admin(request);
+async function listRecentOrdersFromShopify(admin: AdminApiContext) {
+  const res = await admin.graphql(
+    `#graphql
+      query RecentOrdersForManagement {
+        orders(first: 250, sortKey: CREATED_AT, reverse: true) {
+          nodes {
+            id
+            name
+            sourceName
+            createdAt
+          }
+        }
+      }
+    `,
+  );
+  const json = (await res.json()) as {
+    data?: {
+      orders?: {
+        nodes?: {
+          id: string;
+          name: string | null;
+          sourceName: string | null;
+          createdAt: string;
+        }[];
+      };
+    };
+    errors?: { message: string }[];
+  };
 
-  const rows = await db.importedOrder.findMany({
+  if (json.errors?.length) {
+    throw new Error(json.errors.map((e) => e.message).join("; "));
+  }
+
+  return json.data?.orders?.nodes ?? [];
+}
+
+export const loader = async ({ request }: LoaderFunctionArgs) => {
+  const { admin, session } = await authenticate.admin(request);
+
+  const tracked = await db.importedOrder.findMany({
     where: { shop: session.shop },
     orderBy: { importedAt: "desc" },
-    take: 500,
+    take: 1000,
   });
 
-  const importedOrders: ImportedOrderRow[] = rows.map((r) => ({
-    id: r.id,
-    orderGid: r.orderGid,
-    orderName: r.orderName,
-    sourceName: r.sourceName,
-    sourceId: r.sourceId,
-    importedAt: r.importedAt.toISOString(),
-  }));
+  const trackedByOrderGid = new Map(tracked.map((r) => [r.orderGid, r]));
+
+  const remoteOrders = await listRecentOrdersFromShopify(admin);
+
+  const importedOrders: ImportedOrderRow[] = remoteOrders.map((o) => {
+    const row = trackedByOrderGid.get(o.id);
+    return {
+      id: row?.id ?? o.id,
+      orderGid: o.id,
+      orderName: o.name,
+      sourceName: row?.sourceName ?? o.sourceName,
+      sourceId: row?.sourceId ?? null,
+      importedAt: row?.importedAt.toISOString() ?? o.createdAt,
+      createdAt: o.createdAt,
+      trackedByApp: Boolean(row),
+    };
+  });
 
   return {
     shop: session.shop,
@@ -158,22 +205,19 @@ export const action = async ({ request }: ActionFunctionArgs) => {
       select: { id: true, orderGid: true },
     });
   } else if (intent === "delete-selected") {
-    const ids = form
-      .getAll("selectedIds")
+    const orderGids = form
+      .getAll("selectedOrderGids")
       .map((v) => String(v))
       .filter(Boolean);
 
-    if (!ids.length) {
+    if (!orderGids.length) {
       return data<ActionResult>(
         { ok: false, deleted: 0, errors: ["No orders were selected."] },
         { status: 400 },
       );
     }
 
-    targets = await db.importedOrder.findMany({
-      where: { id: { in: ids }, shop: session.shop },
-      select: { id: true, orderGid: true },
-    });
+    targets = orderGids.map((orderGid) => ({ id: orderGid, orderGid }));
   } else if (intent === "delete-by-source") {
     try {
       const remoteIds = await listImportedOrderGidsFromShopify(admin);
@@ -204,7 +248,9 @@ export const action = async ({ request }: ActionFunctionArgs) => {
           where: { shop: session.shop, orderGid: t.orderGid },
         });
       } else {
-        await db.importedOrder.delete({ where: { id: t.id } });
+        await db.importedOrder.deleteMany({
+          where: { shop: session.shop, orderGid: t.orderGid },
+        });
       }
     } else {
       errors.push(`${t.orderGid}: ${result.error ?? "delete failed"}`);
@@ -234,7 +280,7 @@ export default function ImportedOrdersPage() {
     <s-page heading="Imported orders">
       <s-section heading="Manage imported orders">
         <s-paragraph>
-          Select orders imported by this app and delete them in bulk from Shopify.
+          Select any orders from your store and delete them in bulk from Shopify.
         </s-paragraph>
 
         <fetcher.Form method="post">
@@ -263,7 +309,8 @@ export default function ImportedOrdersPage() {
                   <th style={{ textAlign: "left", padding: 8 }}>Select</th>
                   <th style={{ textAlign: "left", padding: 8 }}>Order</th>
                   <th style={{ textAlign: "left", padding: 8 }}>Source</th>
-                  <th style={{ textAlign: "left", padding: 8 }}>Imported at</th>
+                  <th style={{ textAlign: "left", padding: 8 }}>Created at</th>
+                  <th style={{ textAlign: "left", padding: 8 }}>Tracked</th>
                 </tr>
               </thead>
               <tbody>
@@ -272,8 +319,8 @@ export default function ImportedOrdersPage() {
                     <td style={{ padding: 8 }}>
                       <input
                         type="checkbox"
-                        name="selectedIds"
-                        value={o.id}
+                        name="selectedOrderGids"
+                        value={o.orderGid}
                         disabled={deleting}
                       />
                     </td>
@@ -284,14 +331,17 @@ export default function ImportedOrdersPage() {
                       {o.sourceName || "-"}
                     </td>
                     <td style={{ padding: 8 }}>
-                      {new Date(o.importedAt).toLocaleString()}
+                      {new Date(o.createdAt || o.importedAt).toLocaleString()}
+                    </td>
+                    <td style={{ padding: 8 }}>
+                      {o.trackedByApp ? "Yes" : "No"}
                     </td>
                   </tr>
                 ))}
                 {!importedOrders.length && (
                   <tr>
-                    <td style={{ padding: 8 }} colSpan={4}>
-                      No imported orders tracked yet.
+                    <td style={{ padding: 8 }} colSpan={5}>
+                      No orders found.
                     </td>
                   </tr>
                 )}
