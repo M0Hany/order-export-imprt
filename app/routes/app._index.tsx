@@ -65,8 +65,8 @@ export default function Index() {
           <s-text type="strong">Export</s-text> →{" "}
           <s-text type="strong">Plain CSV</s-text>. Then upload that file here
           for <s-text type="strong">{shop}</s-text>. Rows are grouped by order{" "}
-          <s-text type="strong">Id</s-text> (or{" "}
-          <s-text type="strong">Name</s-text>), so multi-item orders stay
+          <s-text type="strong">Name</s-text> (fallback{" "}
+          <s-text type="strong">Id</s-text>), so multi-item orders stay
           together.
         </s-paragraph>
         <s-paragraph>

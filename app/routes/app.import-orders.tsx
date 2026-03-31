@@ -14,13 +14,13 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
 };
 
 export const action = async ({ request }: ActionFunctionArgs) => {
-  const { admin } = await authenticate.admin(request);
+  const { admin, session } = await authenticate.admin(request);
 
   const formData = await request.formData();
   const file = formData.get("file");
 
   if (!(file instanceof File) || file.size === 0) {
-    return data({ error: "Choose a non-empty export JSON file." }, { status: 400 });
+    return data({ error: "Choose a non-empty Shopify export CSV file." }, { status: 400 });
   }
 
   const maxBytes = 50 * 1024 * 1024;
@@ -32,7 +32,7 @@ export const action = async ({ request }: ActionFunctionArgs) => {
   }
 
   const raw = await file.text();
-  const result = await importOrdersFromCsv(admin, raw);
+  const result = await importOrdersFromCsv(admin, session.shop, raw);
 
   if (result.error && !result.results.length) {
     return data({ error: result.error }, { status: 400 });

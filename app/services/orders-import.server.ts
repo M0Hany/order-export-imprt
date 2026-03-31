@@ -1,6 +1,7 @@
 import type { AdminApiContext } from "@shopify/shopify-app-react-router/server";
 import type { ExportedOrderV1 } from "./orders-import.types";
 import { parseShopifyAdminOrdersCsv } from "./shopify-orders-csv.server";
+import db from "../db.server";
 
 export type ImportOrderResult = {
   sourceName?: string | null;
@@ -247,6 +248,7 @@ async function clearAutoOrderNoteIfNoCsvNote(
 
 async function importOneOrder(
   admin: AdminApiContext,
+  shop: string,
   order: ExportedOrderV1,
 ): Promise<ImportOrderResult> {
   const base: ImportOrderResult = {
@@ -290,6 +292,27 @@ async function importOneOrder(
     }
   }
 
+  await db.importedOrder.upsert({
+    where: {
+      shop_orderGid: {
+        shop,
+        orderGid: completed.orderId,
+      },
+    },
+    update: {
+      orderName: completed.orderName,
+      sourceName: order.sourceName ?? undefined,
+      sourceId: order.sourceId ?? undefined,
+    },
+    create: {
+      shop,
+      orderGid: completed.orderId,
+      orderName: completed.orderName,
+      sourceName: order.sourceName ?? undefined,
+      sourceId: order.sourceId ?? undefined,
+    },
+  });
+
   return {
     ...base,
     status: "imported",
@@ -302,6 +325,7 @@ async function importOneOrder(
 
 export async function importOrdersFromCsv(
   admin: AdminApiContext,
+  shop: string,
   raw: string,
 ): Promise<ImportOrdersResult> {
   let orders: ExportedOrderV1[];
@@ -314,7 +338,7 @@ export async function importOrdersFromCsv(
 
   const results: ImportOrderResult[] = [];
   for (const order of orders) {
-    const r = await importOneOrder(admin, order);
+    const r = await importOneOrder(admin, shop, order);
     results.push(r);
     await new Promise((r2) => setTimeout(r2, 150));
   }

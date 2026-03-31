@@ -28,3 +28,16 @@ model Session {
   refreshToken        String?
   refreshTokenExpires DateTime?
 }
+
+model ImportedOrder {
+  id          String   @id @default(cuid())
+  shop        String
+  orderGid    String
+  orderName   String?
+  sourceName  String?
+  sourceId    String?
+  importedAt  DateTime @default(now())
+
+  @@unique([shop, orderGid])
+  @@index([shop, importedAt])
+}
