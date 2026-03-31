@@ -32,7 +32,7 @@ services:
       - key: NODE_ENV
         value: production
       - key: SCOPES
-        value: write_draft_orders
+        value: write_draft_orders,write_orders
       - key: DATABASE_URL
         sync: false
       - key: SHOPIFY_API_KEY

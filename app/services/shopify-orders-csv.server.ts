@@ -51,6 +51,32 @@ function parseDecimal(raw: string): string | null {
   return n.toFixed(2);
 }
 
+function sanitizePhone(
+  raw: string | null | undefined,
+  countryCode?: string | null,
+): string | undefined {
+  const t = raw?.trim();
+  if (!t) return undefined;
+
+  // If Excel exported phone as a number, it may become scientific notation
+  // like "2.01E+11" which Shopify rejects.
+  if (/[eE][+-]?\d+/.test(t)) return undefined;
+
+  const cc = countryCode?.trim()?.toUpperCase();
+  const digits = t.replace(/[^\d]/g, "");
+  if (!digits) return undefined;
+
+  // Egypt heuristic: local often exported without the leading 0.
+  if (cc === "EG") {
+    if (digits.startsWith("0")) return `+20${digits.slice(1)}`;
+    if (digits.length === 10 && digits.startsWith("1")) return `+20${digits}`;
+  }
+
+  if (t.startsWith("+")) return `+${digits}`;
+  if (digits.length < 7 || digits.length > 15) return undefined;
+  return digits;
+}
+
 function splitPersonName(full: string): {
   firstName?: string;
   lastName?: string;
@@ -78,9 +104,10 @@ function addressFromRow(
   const countryRaw =
     cell(row, `${prefix} Country`) || cell(row, `${prefix} Country Code`);
   const company = cell(row, `${prefix} Company`);
-  const phone = cell(row, `${prefix} Phone`);
+  const phoneRaw = cell(row, `${prefix} Phone`);
 
   const countryCode = normalizeCountry(countryRaw);
+  const phone = sanitizePhone(phoneRaw, countryCode);
 
   if (
     !address1 &&
@@ -148,17 +175,29 @@ function orderFromGroup(rows: Record<string, string>[]): ExportedOrderV1 {
     if (li) lineItems.push(li);
   }
 
-  const noteParts = [
-    cell(base, "Notes"),
-    cell(base, "Note Attributes"),
-    cell(base, "Payment Method")
-      ? `Payment method: ${cell(base, "Payment Method")}`
-      : "",
-    cell(base, "Payment Reference")
-      ? `Payment reference: ${cell(base, "Payment Reference")}`
-      : "",
-    cell(base, "Cancelled at") ? `Cancelled at: ${cell(base, "Cancelled at")}` : "",
-  ].filter(Boolean);
+  let notesOnly = cell(base, "Notes");
+  const paymentMethod = cell(base, "Payment Method");
+  if (notesOnly && paymentMethod) {
+    const n = notesOnly.trim();
+    const pm = paymentMethod.trim();
+    if (
+      n === pm ||
+      n.toLowerCase() === `payment method: ${pm}`.toLowerCase()
+    ) {
+      // Some CSV exports put payment context into the Notes column; don't keep it.
+      notesOnly = "";
+    }
+  }
+
+  const shippingAddress = addressFromRow(base, "Shipping");
+  const billingAddress = addressFromRow(base, "Billing");
+  const inferredCountry =
+    billingAddress?.countryCode || shippingAddress?.countryCode;
+  const phoneFromCsv = cell(base, "Phone");
+  const phone =
+    sanitizePhone(phoneFromCsv, inferredCountry) ||
+    billingAddress?.phone ||
+    shippingAddress?.phone;
 
   const discount = cell(base, "Discount Code");
   const discountCodes = discount
@@ -180,19 +219,19 @@ function orderFromGroup(rows: Record<string, string>[]): ExportedOrderV1 {
     displayFinancialStatus: cell(base, "Financial Status") || undefined,
     displayFulfillmentStatus: cell(base, "Fulfillment Status") || undefined,
     email: cell(base, "Email") || undefined,
-    phone: cell(base, "Phone") || undefined,
-    note: noteParts.length ? noteParts.join("\n\n") : undefined,
+    phone: phone || undefined,
+    note: notesOnly ? notesOnly : undefined,
     tags: parseTags(cell(base, "Tags")),
     poNumber: cell(base, "Receipt Number") || undefined,
     customer: cell(base, "Email")
       ? {
           email: cell(base, "Email"),
-          phone: cell(base, "Phone") || undefined,
+          phone,
           ...splitPersonName(cell(base, "Billing Name")),
         }
       : null,
-    shippingAddress: addressFromRow(base, "Shipping"),
-    billingAddress: addressFromRow(base, "Billing"),
+    shippingAddress,
+    billingAddress,
     lineItems,
     discountCodes,
     shippingLineTitle: cell(base, "Shipping Method") || "Shipping",

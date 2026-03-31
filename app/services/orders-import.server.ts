@@ -211,6 +211,40 @@ async function draftOrderComplete(admin: AdminApiContext, draftOrderId: string) 
   return { orderId: ord.id, orderName: ord.name, error: undefined };
 }
 
+/**
+ * Shopify often writes payment context (e.g. COD) into the order note when a draft
+ * is completed with no merchant note. Clear it when the CSV had no Notes column text.
+ */
+async function clearAutoOrderNoteIfNoCsvNote(
+  admin: AdminApiContext,
+  orderId: string,
+): Promise<string | null> {
+  const res = await admin.graphql(
+    `#graphql
+      mutation OrderUpdateClearNote($input: OrderInput!) {
+        orderUpdate(input: $input) {
+          userErrors {
+            message
+          }
+        }
+      }
+    `,
+    { variables: { input: { id: orderId, note: "" } } },
+  );
+  const json = (await res.json()) as {
+    data?: { orderUpdate?: { userErrors: { message: string }[] } };
+    errors?: { message: string }[];
+  };
+  if (json.errors?.length) {
+    return json.errors.map((e) => e.message).join("; ");
+  }
+  const errs = json.data?.orderUpdate?.userErrors;
+  if (errs?.length) {
+    return errs.map((e) => e.message).join("; ");
+  }
+  return null;
+}
+
 async function importOneOrder(
   admin: AdminApiContext,
   order: ExportedOrderV1,
@@ -229,6 +263,8 @@ async function importOneOrder(
     };
   }
 
+  const hadCsvNote = Boolean(order.note?.trim());
+
   const created = await draftOrderCreate(admin, order);
   if (created.error || !created.draftOrderId) {
     return {
@@ -246,12 +282,21 @@ async function importOneOrder(
     };
   }
 
+  let extraMessage: string | undefined;
+  if (!hadCsvNote && completed.orderId) {
+    const clearErr = await clearAutoOrderNoteIfNoCsvNote(admin, completed.orderId);
+    if (clearErr) {
+      extraMessage = `Note could not be cleared: ${clearErr}`;
+    }
+  }
+
   return {
     ...base,
     status: "imported",
     newOrderId: completed.orderId,
     newOrderName: completed.orderName,
     draftOrderId: created.draftOrderId,
+    message: extraMessage,
   };
 }
 

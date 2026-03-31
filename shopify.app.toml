@@ -20,12 +20,11 @@
 
 client_id = "77108b12886ef9742eb033c9c85defae"
 name = "Orders Export Import"
-application_url = "https://example.com"
+application_url = "https://orders-export-import.onrender.com"
 embedded = true
 
 [build]
-automatically_update_urls_on_dev = true
-include_config_on_deploy = true
+automatically_update_urls_on_dev = false
 
 [webhooks]
 api_version = "2026-01"
@@ -39,11 +38,11 @@ api_version = "2026-01"
   uri = "/webhooks/app/scopes_update"
 
 [access_scopes]
-scopes = "write_draft_orders"
+scopes = "write_draft_orders,write_orders"
 optional_scopes = [ ]
 use_legacy_install_flow = false
 
 [auth]
 redirect_urls = [
-  "https://example.com/auth/callback",
+  "https://orders-export-import.onrender.com/auth/callback",
 ]
