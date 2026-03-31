@@ -275,7 +275,9 @@ export function parseShopifyAdminOrdersCsv(raw: string): ExportedOrderV1[] {
 
   const groups = new Map<string, Record<string, string>[]>();
   for (const row of records) {
-    const key = cell(row, "Id") || cell(row, "Name");
+    // Spreadsheet tools often convert Id to scientific notation (e.g. 6.94E+12),
+    // which is not unique and can merge different orders. Name is usually stable.
+    const key = cell(row, "Name") || cell(row, "Id");
     if (!key) continue;
     if (!groups.has(key)) groups.set(key, []);
     groups.get(key)!.push(row);
