@@ -68,6 +68,60 @@ async function deleteOrderByGid(admin: AdminApiContext, orderGid: string) {
   return { ok: true, error: null, deleted: Boolean(payload?.deletedId) };
 }
 
+async function listImportedOrderGidsFromShopify(admin: AdminApiContext) {
+  const ids: string[] = [];
+  let cursor: string | null = null;
+  let hasNext = true;
+
+  while (hasNext) {
+    const res = await admin.graphql(
+      `#graphql
+        query ImportedOrdersBySource($cursor: String) {
+          orders(
+            first: 100
+            after: $cursor
+            query: "source_name:orders-export-import"
+            sortKey: CREATED_AT
+            reverse: true
+          ) {
+            pageInfo {
+              hasNextPage
+              endCursor
+            }
+            nodes {
+              id
+            }
+          }
+        }
+      `,
+      { variables: { cursor } },
+    );
+
+    const json = (await res.json()) as {
+      data?: {
+        orders?: {
+          pageInfo?: { hasNextPage?: boolean; endCursor?: string | null };
+          nodes?: { id: string }[];
+        };
+      };
+      errors?: { message: string }[];
+    };
+
+    if (json.errors?.length) {
+      throw new Error(json.errors.map((e) => e.message).join("; "));
+    }
+
+    const conn = json.data?.orders;
+    for (const n of conn?.nodes ?? []) {
+      if (n.id) ids.push(n.id);
+    }
+    hasNext = Boolean(conn?.pageInfo?.hasNextPage);
+    cursor = conn?.pageInfo?.endCursor ?? null;
+  }
+
+  return ids;
+}
+
 export const loader = async ({ request }: LoaderFunctionArgs) => {
   const { session } = await authenticate.admin(request);
 
@@ -120,6 +174,17 @@ export const action = async ({ request }: ActionFunctionArgs) => {
       where: { id: { in: ids }, shop: session.shop },
       select: { id: true, orderGid: true },
     });
+  } else if (intent === "delete-by-source") {
+    try {
+      const remoteIds = await listImportedOrderGidsFromShopify(admin);
+      targets = remoteIds.map((orderGid) => ({ id: orderGid, orderGid }));
+    } catch (e) {
+      const message = e instanceof Error ? e.message : String(e);
+      return data<ActionResult>(
+        { ok: false, deleted: 0, errors: [message] },
+        { status: 500 },
+      );
+    }
   } else {
     return data<ActionResult>(
       { ok: false, deleted: 0, errors: ["Unknown action."] },
@@ -134,7 +199,13 @@ export const action = async ({ request }: ActionFunctionArgs) => {
     const result = await deleteOrderByGid(admin, t.orderGid);
     if (result.ok || result.deleted) {
       deleted += 1;
-      await db.importedOrder.delete({ where: { id: t.id } });
+      if (intent === "delete-by-source") {
+        await db.importedOrder.deleteMany({
+          where: { shop: session.shop, orderGid: t.orderGid },
+        });
+      } else {
+        await db.importedOrder.delete({ where: { id: t.id } });
+      }
     } else {
       errors.push(`${t.orderGid}: ${result.error ?? "delete failed"}`);
     }
@@ -240,6 +311,24 @@ export default function ImportedOrdersPage() {
               Delete all imported orders
             </s-button>
           </s-stack>
+        </fetcher.Form>
+
+        <fetcher.Form method="post">
+          <input type="hidden" name="intent" value="delete-by-source" />
+          <s-stack direction="inline" gap="base">
+            <s-button
+              type="submit"
+              variant="primary"
+              disabled={deleting}
+            >
+              Delete previously imported orders (source filter)
+            </s-button>
+          </s-stack>
+          <s-paragraph>
+            Use this for old imports created before tracking existed. It deletes
+            Shopify orders where <code>source_name</code> is
+            <code>orders-export-import</code>.
+          </s-paragraph>
         </fetcher.Form>
 
         {fetcher.data && (
