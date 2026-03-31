@@ -5,6 +5,8 @@ import type {
   ExportedOrderV1,
 } from "./orders-import.types";
 
+export type ShopifyOrderRow = Record<string, string>;
+
 const COUNTRY_TO_CODE: Record<string, string> = {
   "united states": "US",
   usa: "US",
@@ -31,7 +33,7 @@ function normalizeCountry(raw: string | undefined): string | undefined {
   return COUNTRY_TO_CODE[t.toLowerCase()];
 }
 
-function cell(row: Record<string, string>, key: string) {
+function cell(row: ShopifyOrderRow, key: string) {
   const v = row[key];
   return v == null ? "" : String(v).trim();
 }
@@ -88,7 +90,7 @@ function splitPersonName(full: string): {
 }
 
 function addressFromRow(
-  row: Record<string, string>,
+  row: ShopifyOrderRow,
   prefix: "Billing" | "Shipping",
 ): ExportedAddressV1 | null {
   const name = cell(row, `${prefix} Name`);
@@ -143,7 +145,7 @@ function parseTags(raw: string): string[] {
 }
 
 function lineItemFromRow(
-  row: Record<string, string>,
+  row: ShopifyOrderRow,
   currencyCode: string,
 ): ExportedLineItemV1 | null {
   const title = cell(row, "Lineitem name");
@@ -163,7 +165,7 @@ function lineItemFromRow(
   };
 }
 
-function orderFromGroup(rows: Record<string, string>[]): ExportedOrderV1 {
+function orderFromGroup(rows: ShopifyOrderRow[]): ExportedOrderV1 {
   const base = rows[0];
   const currencyCode = cell(base, "Currency") || "USD";
   const id = cell(base, "Id");
@@ -239,28 +241,9 @@ function orderFromGroup(rows: Record<string, string>[]): ExportedOrderV1 {
   };
 }
 
-export function parseShopifyAdminOrdersCsv(raw: string): ExportedOrderV1[] {
-  const text = raw.replace(/^\uFEFF/, "").trim();
-  if (!text) {
-    throw new Error("CSV file is empty.");
-  }
-
-  let records: Record<string, string>[];
-  try {
-    records = parse(text, {
-      columns: true,
-      skip_empty_lines: true,
-      trim: true,
-      relax_column_count: true,
-      relax_quotes: true,
-    }) as Record<string, string>[];
-  } catch (e) {
-    const msg = e instanceof Error ? e.message : String(e);
-    throw new Error(`Could not parse CSV: ${msg}`);
-  }
-
+export function parseShopifyAdminOrdersRows(records: ShopifyOrderRow[]): ExportedOrderV1[] {
   if (!records.length) {
-    throw new Error("CSV has no data rows.");
+    throw new Error("File has no data rows.");
   }
 
   const headers = Object.keys(records[0] || {});
@@ -273,7 +256,7 @@ export function parseShopifyAdminOrdersCsv(raw: string): ExportedOrderV1[] {
     );
   }
 
-  const groups = new Map<string, Record<string, string>[]>();
+  const groups = new Map<string, ShopifyOrderRow[]>();
   for (const row of records) {
     // Spreadsheet tools often convert Id to scientific notation (e.g. 6.94E+12),
     // which is not unique and can merge different orders. Name is usually stable.
@@ -288,4 +271,27 @@ export function parseShopifyAdminOrdersCsv(raw: string): ExportedOrderV1[] {
   }
 
   return [...groups.values()].map(orderFromGroup);
+}
+
+export function parseShopifyAdminOrdersCsv(raw: string): ExportedOrderV1[] {
+  const text = raw.replace(/^\uFEFF/, "").trim();
+  if (!text) {
+    throw new Error("CSV file is empty.");
+  }
+
+  let records: ShopifyOrderRow[];
+  try {
+    records = parse(text, {
+      columns: true,
+      skip_empty_lines: true,
+      trim: true,
+      relax_column_count: true,
+      relax_quotes: true,
+    }) as ShopifyOrderRow[];
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
+    throw new Error(`Could not parse CSV: ${msg}`);
+  }
+
+  return parseShopifyAdminOrdersRows(records);
 }

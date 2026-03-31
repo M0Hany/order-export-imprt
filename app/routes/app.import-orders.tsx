@@ -6,7 +6,10 @@ import type {
 import { data, redirect } from "react-router";
 import { boundary } from "@shopify/shopify-app-react-router/server";
 import { authenticate } from "../shopify.server";
-import { importOrdersFromCsv } from "../services/orders-import.server";
+import {
+  importOrdersFromCsv,
+  importOrdersFromXlsx,
+} from "../services/orders-import.server";
 
 export const loader = async ({ request }: LoaderFunctionArgs) => {
   await authenticate.admin(request);
@@ -20,7 +23,10 @@ export const action = async ({ request }: ActionFunctionArgs) => {
   const file = formData.get("file");
 
   if (!(file instanceof File) || file.size === 0) {
-    return data({ error: "Choose a non-empty Shopify export CSV file." }, { status: 400 });
+    return data(
+      { error: "Choose a non-empty Shopify export CSV or XLSX file." },
+      { status: 400 },
+    );
   }
 
   const maxBytes = 50 * 1024 * 1024;
@@ -31,8 +37,23 @@ export const action = async ({ request }: ActionFunctionArgs) => {
     );
   }
 
-  const raw = await file.text();
-  const result = await importOrdersFromCsv(admin, session.shop, raw);
+  const fileName = file.name.toLowerCase();
+  const isXlsx =
+    fileName.endsWith(".xlsx") ||
+    file.type ===
+      "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet";
+  const isCsv = fileName.endsWith(".csv") || file.type === "text/csv";
+
+  if (!isCsv && !isXlsx) {
+    return data(
+      { error: "Unsupported file type. Upload a Shopify export CSV or XLSX file." },
+      { status: 400 },
+    );
+  }
+
+  const result = isXlsx
+    ? await importOrdersFromXlsx(admin, session.shop, await file.arrayBuffer())
+    : await importOrdersFromCsv(admin, session.shop, await file.text());
 
   if (result.error && !result.results.length) {
     return data({ error: result.error }, { status: 400 });

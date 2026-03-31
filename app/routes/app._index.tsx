@@ -63,9 +63,9 @@ export default function Index() {
           Export orders from your source store in Shopify Admin:{" "}
           <s-text type="strong">Orders</s-text> → select orders →{" "}
           <s-text type="strong">Export</s-text> →{" "}
-          <s-text type="strong">Plain CSV</s-text>. Then upload that file here
-          for <s-text type="strong">{shop}</s-text>. Rows are grouped by order{" "}
-          <s-text type="strong">Name</s-text> (fallback{" "}
+          <s-text type="strong">CSV (or XLSX)</s-text>. Then upload that file
+          here for <s-text type="strong">{shop}</s-text>. Rows are grouped by
+          order <s-text type="strong">Name</s-text> (fallback{" "}
           <s-text type="strong">Id</s-text>), so multi-item orders stay
           together.
         </s-paragraph>
@@ -90,7 +90,7 @@ export default function Index() {
             <input
               type="file"
               name="file"
-              accept=".csv,text/csv"
+              accept=".csv,.xlsx,text/csv,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
               required
               disabled={busy}
             />
@@ -149,7 +149,7 @@ export default function Index() {
             required for import).
           </s-list-item>
           <s-list-item>
-            Large CSV files are limited to 50 MB per upload in this app.
+            Large CSV/XLSX files are limited to 50 MB per upload in this app.
           </s-list-item>
           <s-list-item>
             Country must be a 2-letter code or a common English country name we

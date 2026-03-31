@@ -1,6 +1,7 @@
 import type { AdminApiContext } from "@shopify/shopify-app-react-router/server";
 import type { ExportedOrderV1 } from "./orders-import.types";
 import { parseShopifyAdminOrdersCsv } from "./shopify-orders-csv.server";
+import { parseShopifyAdminOrdersXlsx } from "./shopify-orders-xlsx.server";
 import db from "../db.server";
 
 export type ImportOrderResult = {
@@ -336,6 +337,30 @@ export async function importOrdersFromCsv(
     return { ok: false, results: [], error: message };
   }
 
+  return importParsedOrders(admin, shop, orders);
+}
+
+export async function importOrdersFromXlsx(
+  admin: AdminApiContext,
+  shop: string,
+  fileBuffer: ArrayBuffer,
+): Promise<ImportOrdersResult> {
+  let orders: ExportedOrderV1[];
+  try {
+    orders = parseShopifyAdminOrdersXlsx(fileBuffer);
+  } catch (e) {
+    const message = e instanceof Error ? e.message : String(e);
+    return { ok: false, results: [], error: message };
+  }
+
+  return importParsedOrders(admin, shop, orders);
+}
+
+async function importParsedOrders(
+  admin: AdminApiContext,
+  shop: string,
+  orders: ExportedOrderV1[],
+): Promise<ImportOrdersResult> {
   const results: ImportOrderResult[] = [];
   for (const order of orders) {
     const r = await importOneOrder(admin, shop, order);
