@@ -4,11 +4,13 @@ import type {
   LoaderFunctionArgs,
 } from "react-router";
 import { data, useFetcher, useLoaderData } from "react-router";
-import { useMemo } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { boundary } from "@shopify/shopify-app-react-router/server";
 import type { AdminApiContext } from "@shopify/shopify-app-react-router/server";
 import { authenticate } from "../shopify.server";
 import db from "../db.server";
+
+const PAGE_SIZE = 50;
 
 type ImportedOrderRow = {
   id: string;
@@ -25,6 +27,8 @@ type ActionResult = {
   ok: boolean;
   deleted: number;
   errors: string[];
+  orderGids?: string[];
+  deletedOrderGids?: string[];
 };
 
 async function deleteOrderByGid(admin: AdminApiContext, orderGid: string) {
@@ -124,11 +128,15 @@ async function listImportedOrderGidsFromShopify(admin: AdminApiContext) {
   return ids;
 }
 
-async function listRecentOrdersFromShopify(admin: AdminApiContext) {
+async function fetchOrdersPage(admin: AdminApiContext, after: string | null) {
   const res = await admin.graphql(
     `#graphql
-      query RecentOrdersForManagement {
-        orders(first: 250, sortKey: CREATED_AT, reverse: true) {
+      query OrdersForManagement($after: String) {
+        orders(first: ${PAGE_SIZE}, after: $after, sortKey: CREATED_AT, reverse: true) {
+          pageInfo {
+            hasNextPage
+            endCursor
+          }
           nodes {
             id
             name
@@ -138,10 +146,12 @@ async function listRecentOrdersFromShopify(admin: AdminApiContext) {
         }
       }
     `,
+    { variables: { after } },
   );
   const json = (await res.json()) as {
     data?: {
       orders?: {
+        pageInfo?: { hasNextPage?: boolean; endCursor?: string | null };
         nodes?: {
           id: string;
           name: string | null;
@@ -157,21 +167,49 @@ async function listRecentOrdersFromShopify(admin: AdminApiContext) {
     throw new Error(json.errors.map((e) => e.message).join("; "));
   }
 
-  return json.data?.orders?.nodes ?? [];
+  return {
+    nodes: json.data?.orders?.nodes ?? [],
+    pageInfo: json.data?.orders?.pageInfo ?? {
+      hasNextPage: false,
+      endCursor: null,
+    },
+  };
+}
+
+async function fetchOrdersByPageNumber(admin: AdminApiContext, page: number) {
+  let currentPage = 1;
+  let after: string | null = null;
+  let result = await fetchOrdersPage(admin, after);
+
+  while (currentPage < page && result.pageInfo.hasNextPage) {
+    after = result.pageInfo.endCursor ?? null;
+    result = await fetchOrdersPage(admin, after);
+    currentPage += 1;
+  }
+
+  return {
+    nodes: result.nodes,
+    hasNextPage: Boolean(result.pageInfo.hasNextPage),
+    actualPage: currentPage,
+  };
 }
 
 export const loader = async ({ request }: LoaderFunctionArgs) => {
   const { admin, session } = await authenticate.admin(request);
+  const url = new URL(request.url);
+  const requestedPage = Math.max(1, Number(url.searchParams.get("page") || "1"));
+
+  const pageResult = await fetchOrdersByPageNumber(admin, requestedPage);
+  const remoteOrders = pageResult.nodes;
 
   const tracked = await db.importedOrder.findMany({
-    where: { shop: session.shop },
+    where: {
+      shop: session.shop,
+      orderGid: { in: remoteOrders.map((o) => o.id) },
+    },
     orderBy: { importedAt: "desc" },
-    take: 1000,
   });
-
   const trackedByOrderGid = new Map(tracked.map((r) => [r.orderGid, r]));
-
-  const remoteOrders = await listRecentOrdersFromShopify(admin);
 
   const importedOrders: ImportedOrderRow[] = remoteOrders.map((o) => {
     const row = trackedByOrderGid.get(o.id);
@@ -189,6 +227,9 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
 
   return {
     shop: session.shop,
+    page: pageResult.actualPage,
+    hasPrevPage: pageResult.actualPage > 1,
+    hasNextPage: pageResult.hasNextPage,
     importedOrders,
   };
 };
@@ -205,10 +246,16 @@ export const action = async ({ request }: ActionFunctionArgs) => {
       select: { id: true, orderGid: true },
     });
   } else if (intent === "delete-selected") {
-    const orderGids = form
-      .getAll("selectedOrderGids")
-      .map((v) => String(v))
-      .filter(Boolean);
+    const selectedJson = String(form.get("selectedOrderGidsJson") || "[]");
+    let orderGids: string[] = [];
+    try {
+      const parsed = JSON.parse(selectedJson) as unknown;
+      if (Array.isArray(parsed)) {
+        orderGids = parsed.map((v) => String(v)).filter(Boolean);
+      }
+    } catch {
+      orderGids = [];
+    }
 
     if (!orderGids.length) {
       return data<ActionResult>(
@@ -217,11 +264,37 @@ export const action = async ({ request }: ActionFunctionArgs) => {
       );
     }
 
-    targets = orderGids.map((orderGid) => ({ id: orderGid, orderGid }));
+    targets = [...new Set(orderGids)].map((orderGid) => ({ id: orderGid, orderGid }));
   } else if (intent === "delete-by-source") {
     try {
       const remoteIds = await listImportedOrderGidsFromShopify(admin);
       targets = remoteIds.map((orderGid) => ({ id: orderGid, orderGid }));
+    } catch (e) {
+      const message = e instanceof Error ? e.message : String(e);
+      return data<ActionResult>(
+        { ok: false, deleted: 0, errors: [message] },
+        { status: 500 },
+      );
+    }
+  } else if (intent === "list-all-order-ids") {
+    try {
+      const allIds: string[] = [];
+      let cursor: string | null = null;
+      let hasNext = true;
+
+      while (hasNext) {
+        const page = await fetchOrdersPage(admin, cursor);
+        allIds.push(...page.nodes.map((n) => n.id).filter(Boolean));
+        hasNext = Boolean(page.pageInfo.hasNextPage);
+        cursor = page.pageInfo.endCursor ?? null;
+      }
+
+      return data<ActionResult>({
+        ok: true,
+        deleted: 0,
+        errors: [],
+        orderGids: [...new Set(allIds)],
+      });
     } catch (e) {
       const message = e instanceof Error ? e.message : String(e);
       return data<ActionResult>(
@@ -238,11 +311,13 @@ export const action = async ({ request }: ActionFunctionArgs) => {
 
   let deleted = 0;
   const errors: string[] = [];
+  const deletedOrderGids: string[] = [];
 
   for (const t of targets) {
     const result = await deleteOrderByGid(admin, t.orderGid);
     if (result.ok || result.deleted) {
       deleted += 1;
+      deletedOrderGids.push(t.orderGid);
       if (intent === "delete-by-source") {
         await db.importedOrder.deleteMany({
           where: { shop: session.shop, orderGid: t.orderGid },
@@ -261,19 +336,105 @@ export const action = async ({ request }: ActionFunctionArgs) => {
     ok: errors.length === 0,
     deleted,
     errors,
+    deletedOrderGids,
   });
 };
 
 export default function ImportedOrdersPage() {
-  const { importedOrders } = useLoaderData<typeof loader>();
-  const fetcher = useFetcher<ActionResult>();
+  const { importedOrders, page, hasPrevPage, hasNextPage } =
+    useLoaderData<typeof loader>();
+  const deleteFetcher = useFetcher<ActionResult>();
+  const selectAllFetcher = useFetcher<ActionResult>();
 
-  const deleting = fetcher.state !== "idle";
-  const deleted = fetcher.data?.deleted ?? 0;
+  const deleting = deleteFetcher.state !== "idle";
+  const deleted = deleteFetcher.data?.deleted ?? 0;
   const hasRows = importedOrders.length > 0;
+
+  const [selected, setSelected] = useState<Set<string>>(new Set());
+  const storageKey = "orders-export-import:selected-order-gids";
+
+  useEffect(() => {
+    try {
+      const raw = window.localStorage.getItem(storageKey);
+      if (!raw) return;
+      const arr = JSON.parse(raw) as string[];
+      if (Array.isArray(arr)) setSelected(new Set(arr));
+    } catch {
+      // ignore parse errors
+    }
+  }, []);
+
+  useEffect(() => {
+    window.localStorage.setItem(storageKey, JSON.stringify([...selected]));
+  }, [selected]);
+
+  useEffect(() => {
+    const ids = selectAllFetcher.data?.orderGids;
+    if (!ids?.length) return;
+    setSelected(new Set(ids));
+  }, [selectAllFetcher.data?.orderGids]);
+
+  useEffect(() => {
+    const deletedIds = deleteFetcher.data?.deletedOrderGids;
+    if (!deletedIds?.length) return;
+    setSelected((prev) => {
+      const next = new Set(prev);
+      for (const id of deletedIds) next.delete(id);
+      return next;
+    });
+  }, [deleteFetcher.data?.deletedOrderGids]);
+
+  const selectedCount = selected.size;
+  const selectedOnPageCount = importedOrders.filter((o) =>
+    selected.has(o.orderGid),
+  ).length;
+  const allOnPageSelected =
+    hasRows && importedOrders.every((o) => selected.has(o.orderGid));
+
+  const toggleOne = (orderGid: string, checked: boolean) => {
+    setSelected((prev) => {
+      const next = new Set(prev);
+      if (checked) next.add(orderGid);
+      else next.delete(orderGid);
+      return next;
+    });
+  };
+
+  const togglePage = (checked: boolean) => {
+    setSelected((prev) => {
+      const next = new Set(prev);
+      for (const o of importedOrders) {
+        if (checked) next.add(o.orderGid);
+        else next.delete(o.orderGid);
+      }
+      return next;
+    });
+  };
+
+  const submitDeleteSelected = () => {
+    const fd = new FormData();
+    fd.set("intent", "delete-selected");
+    fd.set("selectedOrderGidsJson", JSON.stringify([...selected]));
+    deleteFetcher.submit(fd, { method: "post" });
+  };
+
+  const submitSelectAllOrders = () => {
+    const fd = new FormData();
+    fd.set("intent", "list-all-order-ids");
+    selectAllFetcher.submit(fd, { method: "post" });
+  };
+
+  const submitDeleteBySource = () => {
+    const fd = new FormData();
+    fd.set("intent", "delete-by-source");
+    deleteFetcher.submit(fd, { method: "post" });
+  };
+
+  const clearSelection = () => setSelected(new Set());
+
   const errorText = useMemo(
-    () => fetcher.data?.errors?.join("\n"),
-    [fetcher.data?.errors],
+    () => deleteFetcher.data?.errors?.join("\n"),
+    [deleteFetcher.data?.errors],
   );
 
   return (
@@ -282,106 +443,123 @@ export default function ImportedOrdersPage() {
         <s-paragraph>
           Select any orders from your store and delete them in bulk from Shopify.
         </s-paragraph>
+        <s-paragraph>
+          Selected across all pages: <s-text type="strong">{selectedCount}</s-text>
+        </s-paragraph>
+        <s-paragraph>
+          Selected on this page: <s-text type="strong">{selectedOnPageCount}</s-text>
+        </s-paragraph>
 
-        <fetcher.Form method="post">
-          <input type="hidden" name="intent" value="delete-selected" />
-          <s-stack direction="inline" gap="base">
-            <s-button
-              type="submit"
-              variant="primary"
-              disabled={deleting || !hasRows}
-              {...(deleting ? { loading: true } : {})}
-            >
-              Delete selected
-            </s-button>
-          </s-stack>
+        <s-stack direction="inline" gap="base">
+          <s-button
+            onClick={() => togglePage(!allOnPageSelected)}
+            disabled={!hasRows || deleting}
+          >
+            {allOnPageSelected ? "Unselect page" : "Select page"}
+          </s-button>
+          <s-button
+            onClick={submitSelectAllOrders}
+            disabled={selectAllFetcher.state !== "idle"}
+            {...(selectAllFetcher.state !== "idle" ? { loading: true } : {})}
+          >
+            Select all orders
+          </s-button>
+          <s-button onClick={clearSelection} disabled={selectedCount === 0 || deleting}>
+            Clear selection
+          </s-button>
+          <s-button
+            variant="primary"
+            onClick={submitDeleteSelected}
+            disabled={selectedCount === 0 || deleting}
+            {...(deleting ? { loading: true } : {})}
+          >
+            Delete selected
+          </s-button>
+        </s-stack>
 
-          <div style={{ marginTop: 12, overflowX: "auto" }}>
-            <table
-              style={{
-                width: "100%",
-                borderCollapse: "collapse",
-                fontSize: 13,
-              }}
-            >
-              <thead>
-                <tr>
-                  <th style={{ textAlign: "left", padding: 8 }}>Select</th>
-                  <th style={{ textAlign: "left", padding: 8 }}>Order</th>
-                  <th style={{ textAlign: "left", padding: 8 }}>Source</th>
-                  <th style={{ textAlign: "left", padding: 8 }}>Created at</th>
-                  <th style={{ textAlign: "left", padding: 8 }}>Tracked</th>
+        <div style={{ marginTop: 12, overflowX: "auto" }}>
+          <table
+            style={{
+              width: "100%",
+              borderCollapse: "collapse",
+              fontSize: 13,
+            }}
+          >
+            <thead>
+              <tr>
+                <th style={{ textAlign: "left", padding: 8 }}>Select</th>
+                <th style={{ textAlign: "left", padding: 8 }}>Order</th>
+                <th style={{ textAlign: "left", padding: 8 }}>Source</th>
+                <th style={{ textAlign: "left", padding: 8 }}>Created at</th>
+                <th style={{ textAlign: "left", padding: 8 }}>Tracked</th>
+              </tr>
+            </thead>
+            <tbody>
+              {importedOrders.map((o) => (
+                <tr key={o.id}>
+                  <td style={{ padding: 8 }}>
+                    <input
+                      type="checkbox"
+                      checked={selected.has(o.orderGid)}
+                      onChange={(e) => toggleOne(o.orderGid, e.currentTarget.checked)}
+                      disabled={deleting}
+                    />
+                  </td>
+                  <td style={{ padding: 8 }}>
+                    {o.orderName || o.orderGid}
+                  </td>
+                  <td style={{ padding: 8 }}>
+                    {o.sourceName || "-"}
+                  </td>
+                  <td style={{ padding: 8 }}>
+                    {new Date(o.createdAt || o.importedAt).toLocaleString()}
+                  </td>
+                  <td style={{ padding: 8 }}>
+                    {o.trackedByApp ? "Yes" : "No"}
+                  </td>
                 </tr>
-              </thead>
-              <tbody>
-                {importedOrders.map((o) => (
-                  <tr key={o.id}>
-                    <td style={{ padding: 8 }}>
-                      <input
-                        type="checkbox"
-                        name="selectedOrderGids"
-                        value={o.orderGid}
-                        disabled={deleting}
-                      />
-                    </td>
-                    <td style={{ padding: 8 }}>
-                      {o.orderName || o.orderGid}
-                    </td>
-                    <td style={{ padding: 8 }}>
-                      {o.sourceName || "-"}
-                    </td>
-                    <td style={{ padding: 8 }}>
-                      {new Date(o.createdAt || o.importedAt).toLocaleString()}
-                    </td>
-                    <td style={{ padding: 8 }}>
-                      {o.trackedByApp ? "Yes" : "No"}
-                    </td>
-                  </tr>
-                ))}
-                {!importedOrders.length && (
-                  <tr>
-                    <td style={{ padding: 8 }} colSpan={5}>
-                      No orders found.
-                    </td>
-                  </tr>
-                )}
-              </tbody>
-            </table>
-          </div>
-        </fetcher.Form>
+              ))}
+              {!importedOrders.length && (
+                <tr>
+                  <td style={{ padding: 8 }} colSpan={5}>
+                    No orders found.
+                  </td>
+                </tr>
+              )}
+            </tbody>
+          </table>
+        </div>
 
-        <fetcher.Form method="post">
-          <input type="hidden" name="intent" value="delete-all" />
-          <s-stack direction="inline" gap="base">
-            <s-button
-              type="submit"
-              variant="primary"
-              disabled={deleting || !hasRows}
-            >
-              Delete all imported orders
-            </s-button>
-          </s-stack>
-        </fetcher.Form>
+        <s-stack direction="inline" gap="base">
+          {hasPrevPage ? (
+            <s-link href={`/app/imported-orders?page=${page - 1}`}>Previous</s-link>
+          ) : (
+            <s-text>Previous</s-text>
+          )}
+          <s-text>Page {page}</s-text>
+          {hasNextPage ? (
+            <s-link href={`/app/imported-orders?page=${page + 1}`}>Next</s-link>
+          ) : (
+            <s-text>Next</s-text>
+          )}
+        </s-stack>
 
-        <fetcher.Form method="post">
-          <input type="hidden" name="intent" value="delete-by-source" />
-          <s-stack direction="inline" gap="base">
-            <s-button
-              type="submit"
-              variant="primary"
-              disabled={deleting}
-            >
-              Delete previously imported orders (source filter)
-            </s-button>
-          </s-stack>
-          <s-paragraph>
-            Use this for old imports created before tracking existed. It deletes
-            Shopify orders where <code>source_name</code> is
-            <code>orders-export-import</code>.
-          </s-paragraph>
-        </fetcher.Form>
+        <s-stack direction="inline" gap="base">
+          <s-button
+            type="button"
+            variant="primary"
+            onClick={submitDeleteBySource}
+            disabled={deleting}
+          >
+            Delete previously imported orders (source filter)
+          </s-button>
+        </s-stack>
+        <s-paragraph>
+          This deletes Shopify orders where <code>source_name</code> is
+          <code>orders-export-import</code>.
+        </s-paragraph>
 
-        {fetcher.data && (
+        {deleteFetcher.data && (
           <s-box
             padding="base"
             borderWidth="base"
