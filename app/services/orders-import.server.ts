@@ -20,6 +20,13 @@ export type ImportOrdersResult = {
   error?: string;
 };
 
+/** Emitted after each order is processed (1-based index). */
+export type ImportProgressPayload = {
+  index: number;
+  total: number;
+  result: ImportOrderResult;
+};
+
 function toMailingInput(
   addr: NonNullable<ExportedOrderV1["shippingAddress"]> | null | undefined,
 ) {
@@ -205,9 +212,11 @@ async function draftOrderComplete(admin: AdminApiContext, draftOrderId: string) 
 }
 
 /**
- * After import, restore customer email/phone on the order (not on the draft, so no
+ * After import, restore customer email on the order (not on the draft, so no
  * confirmation email is sent at complete). Optionally clear the auto-filled payment
  * note when the CSV had no Notes text.
+ *
+ * Do not use OrderInput.phone (not accepted on all Admin API versions); put phone on shippingAddress.
  */
 async function syncOrderContactAndNoteAfterImport(
   admin: AdminApiContext,
@@ -219,19 +228,31 @@ async function syncOrderContactAndNoteAfterImport(
     order.email?.trim() ||
     order.customer?.email?.trim() ||
     undefined;
-  const phone =
+  const orderPhone =
     order.phone?.trim() ||
     order.customer?.phone?.trim() ||
     undefined;
 
-  const hasContact = Boolean(email || phone);
-  if (hadCsvNote && !hasContact) {
+  const canSetPhoneOnShipping =
+    Boolean(orderPhone) && Boolean(order.shippingAddress);
+
+  if (hadCsvNote && !email && !canSetPhoneOnShipping) {
     return null;
   }
 
   const input: Record<string, unknown> = { id: orderId };
   if (email) input.email = email;
-  if (phone) input.phone = phone;
+
+  if (canSetPhoneOnShipping && order.shippingAddress) {
+    const merged = {
+      ...order.shippingAddress,
+      phone:
+        order.shippingAddress.phone?.trim() || orderPhone || undefined,
+    };
+    const mailing = toMailingInput(merged);
+    if (mailing) input.shippingAddress = mailing;
+  }
+
   if (!hadCsvNote) input.note = "";
 
   const res = await admin.graphql(
@@ -346,6 +367,7 @@ export async function importOrdersFromCsv(
   admin: AdminApiContext,
   shop: string,
   raw: string,
+  onProgress?: (payload: ImportProgressPayload) => void,
 ): Promise<ImportOrdersResult> {
   let orders: ExportedOrderV1[];
   try {
@@ -355,13 +377,14 @@ export async function importOrdersFromCsv(
     return { ok: false, results: [], error: message };
   }
 
-  return importParsedOrders(admin, shop, orders);
+  return importParsedOrders(admin, shop, orders, onProgress);
 }
 
 export async function importOrdersFromXlsx(
   admin: AdminApiContext,
   shop: string,
   fileBuffer: ArrayBuffer,
+  onProgress?: (payload: ImportProgressPayload) => void,
 ): Promise<ImportOrdersResult> {
   let orders: ExportedOrderV1[];
   try {
@@ -371,18 +394,21 @@ export async function importOrdersFromXlsx(
     return { ok: false, results: [], error: message };
   }
 
-  return importParsedOrders(admin, shop, orders);
+  return importParsedOrders(admin, shop, orders, onProgress);
 }
 
 async function importParsedOrders(
   admin: AdminApiContext,
   shop: string,
   orders: ExportedOrderV1[],
+  onProgress?: (payload: ImportProgressPayload) => void,
 ): Promise<ImportOrdersResult> {
   const results: ImportOrderResult[] = [];
-  for (const order of orders) {
-    const r = await importOneOrder(admin, shop, order);
+  const total = orders.length;
+  for (let i = 0; i < orders.length; i++) {
+    const r = await importOneOrder(admin, shop, orders[i]!);
     results.push(r);
+    onProgress?.({ index: i + 1, total, result: r });
     await new Promise((r2) => setTimeout(r2, 150));
   }
 

@@ -9,6 +9,7 @@ import { authenticate } from "../shopify.server";
 import {
   importOrdersFromCsv,
   importOrdersFromXlsx,
+  type ImportOrderResult,
 } from "../services/orders-import.server";
 
 export const loader = async ({ request }: LoaderFunctionArgs) => {
@@ -16,8 +17,20 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
   return redirect("/app");
 };
 
+function importSummaryFromResults(results: ImportOrderResult[]) {
+  return {
+    total: results.length,
+    imported: results.filter((r) => r.status === "imported").length,
+    skipped: results.filter((r) => r.status === "skipped").length,
+    failed: results.filter((r) => r.status === "error").length,
+  };
+}
+
 export const action = async ({ request }: ActionFunctionArgs) => {
   const { admin, session } = await authenticate.admin(request);
+  const wantsStream = (request.headers.get("Accept") || "").includes(
+    "application/x-ndjson",
+  );
 
   const formData = await request.formData();
   const file = formData.get("file");
@@ -51,6 +64,70 @@ export const action = async ({ request }: ActionFunctionArgs) => {
     );
   }
 
+  if (wantsStream) {
+    const encoder = new TextEncoder();
+    const xlsxBuffer = isXlsx ? await file.arrayBuffer() : null;
+    const csvText = isCsv ? await file.text() : "";
+
+    const stream = new ReadableStream({
+      async start(controller) {
+        const send = (obj: unknown) => {
+          controller.enqueue(encoder.encode(`${JSON.stringify(obj)}\n`));
+        };
+        try {
+          const onProgress = (payload: {
+            index: number;
+            total: number;
+            result: ImportOrderResult;
+          }) => {
+            send({ type: "progress", ...payload });
+          };
+
+          const result = isXlsx
+            ? await importOrdersFromXlsx(
+                admin,
+                session.shop,
+                xlsxBuffer!,
+                onProgress,
+              )
+            : await importOrdersFromCsv(
+                admin,
+                session.shop,
+                csvText,
+                onProgress,
+              );
+
+          if (result.error && !result.results.length) {
+            send({ type: "error", message: result.error });
+            return;
+          }
+
+          send({
+            type: "complete",
+            ok: result.ok,
+            summary: importSummaryFromResults(result.results),
+            results: result.results,
+            warning: result.error,
+          });
+        } catch (e) {
+          send({
+            type: "error",
+            message: e instanceof Error ? e.message : String(e),
+          });
+        } finally {
+          controller.close();
+        }
+      },
+    });
+
+    return new Response(stream, {
+      headers: {
+        "Content-Type": "application/x-ndjson; charset=utf-8",
+        "Cache-Control": "no-store",
+      },
+    });
+  }
+
   const result = isXlsx
     ? await importOrdersFromXlsx(admin, session.shop, await file.arrayBuffer())
     : await importOrdersFromCsv(admin, session.shop, await file.text());
@@ -61,12 +138,7 @@ export const action = async ({ request }: ActionFunctionArgs) => {
 
   return data({
     ok: result.ok,
-    summary: {
-      total: result.results.length,
-      imported: result.results.filter((r) => r.status === "imported").length,
-      skipped: result.results.filter((r) => r.status === "skipped").length,
-      failed: result.results.filter((r) => r.status === "error").length,
-    },
+    summary: importSummaryFromResults(result.results),
     results: result.results,
     warning: result.error,
   });

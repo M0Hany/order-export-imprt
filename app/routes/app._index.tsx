@@ -1,27 +1,54 @@
-import { useEffect, useRef } from "react";
+import { useCallback, useRef, useState } from "react";
+import type { FormEvent } from "react";
 import type { HeadersFunction, LoaderFunctionArgs } from "react-router";
-import { useFetcher, useLoaderData } from "react-router";
+import { useLoaderData } from "react-router";
 import { useAppBridge } from "@shopify/app-bridge-react";
 import { boundary } from "@shopify/shopify-app-react-router/server";
 import { authenticate } from "../shopify.server";
+import type { ImportOrderResult } from "../services/orders-import.server";
 
-type ImportActionData = {
-  error?: string;
-  ok?: boolean;
-  warning?: string;
-  summary?: {
-    total: number;
-    imported: number;
-    skipped: number;
-    failed: number;
-  };
-  results?: {
-    sourceName?: string | null;
-    status: string;
-    newOrderName?: string;
-    message?: string;
-  }[];
+type ImportSummary = {
+  total: number;
+  imported: number;
+  skipped: number;
+  failed: number;
 };
+
+type StreamProgress = {
+  index: number;
+  total: number;
+  result: ImportOrderResult;
+};
+
+type StreamComplete = {
+  type: "complete";
+  ok: boolean;
+  summary: ImportSummary;
+  results: ImportOrderResult[];
+  warning?: string;
+};
+
+type StreamError = { type: "error"; message: string };
+
+type StreamProgressEvent = { type: "progress" } & StreamProgress;
+
+type StreamEvent = StreamProgressEvent | StreamComplete | StreamError;
+
+function orderRowLabel(result: ImportOrderResult, index: number): string {
+  const name = result.newOrderName?.trim();
+  if (name) return name;
+  const sid = result.sourceId?.trim();
+  if (sid) return sid;
+  return `Source order ${index}`;
+}
+
+function statusTone(
+  status: ImportOrderResult["status"],
+): "success" | "caution" | "critical" {
+  if (status === "imported") return "success";
+  if (status === "skipped") return "caution";
+  return "critical";
+}
 
 export const loader = async ({ request }: LoaderFunctionArgs) => {
   const { session } = await authenticate.admin(request);
@@ -30,31 +57,120 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
 
 export default function Index() {
   const { shop } = useLoaderData<typeof loader>();
-  const fetcher = useFetcher<ImportActionData>();
   const shopify = useAppBridge();
-  const lastNotified = useRef<string | null>(null);
+  const lastToastKey = useRef<string | null>(null);
 
-  const busy =
-    fetcher.state === "submitting" || fetcher.state === "loading";
+  const [busy, setBusy] = useState(false);
+  const [progressRows, setProgressRows] = useState<StreamProgress[]>([]);
+  const [complete, setComplete] = useState<StreamComplete | null>(null);
+  const [streamError, setStreamError] = useState<string | null>(null);
 
-  useEffect(() => {
-    if (fetcher.state !== "idle" || !fetcher.data) return;
-    const key = JSON.stringify(fetcher.data);
-    if (lastNotified.current === key) return;
-    lastNotified.current = key;
+  const handleImport = useCallback(
+    async (e: FormEvent<HTMLFormElement>) => {
+      e.preventDefault();
+      const form = e.currentTarget;
+      const fileInput = form.elements.namedItem("file") as HTMLInputElement;
+      if (!fileInput?.files?.length) {
+        shopify.toast.show("Choose a file to import.", { isError: true });
+        return;
+      }
 
-    if (fetcher.data.error) {
-      shopify.toast.show(fetcher.data.error, { isError: true });
-      return;
-    }
-    if (fetcher.data.summary) {
-      const { imported, skipped, failed } = fetcher.data.summary;
-      shopify.toast.show(
-        `Import finished: ${imported} imported, ${skipped} skipped, ${failed} failed.`,
-        { isError: Boolean(failed) },
-      );
-    }
-  }, [fetcher.state, fetcher.data, shopify]);
+      setBusy(true);
+      setProgressRows([]);
+      setComplete(null);
+      setStreamError(null);
+
+      const fd = new FormData(form);
+
+      try {
+        const res = await fetch("/app/import-orders", {
+          method: "POST",
+          body: fd,
+          headers: { Accept: "application/x-ndjson" },
+          credentials: "same-origin",
+        });
+
+        if (!res.ok) {
+          const ct = res.headers.get("content-type") || "";
+          let message = `Request failed (${res.status}).`;
+          if (ct.includes("application/json")) {
+            try {
+              const j = (await res.json()) as { error?: string };
+              if (j.error) message = j.error;
+            } catch {
+              /* ignore */
+            }
+          }
+          setStreamError(message);
+          shopify.toast.show(message, { isError: true });
+          return;
+        }
+
+        const reader = res.body?.getReader();
+        if (!reader) {
+          const message = "No response body from server.";
+          setStreamError(message);
+          shopify.toast.show(message, { isError: true });
+          return;
+        }
+
+        const decoder = new TextDecoder();
+        let buffer = "";
+
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          buffer += decoder.decode(value, { stream: true });
+          const lines = buffer.split("\n");
+          buffer = lines.pop() ?? "";
+          for (const line of lines) {
+            if (!line.trim()) continue;
+            let evt: StreamEvent;
+            try {
+              evt = JSON.parse(line) as StreamEvent;
+            } catch {
+              continue;
+            }
+            if (evt.type === "progress") {
+              setProgressRows((prev) => [
+                ...prev,
+                {
+                  index: evt.index,
+                  total: evt.total,
+                  result: evt.result,
+                },
+              ]);
+            } else if (evt.type === "complete") {
+              setComplete(evt);
+              const key = `done-${evt.summary.imported}-${evt.summary.failed}`;
+              if (lastToastKey.current !== key) {
+                lastToastKey.current = key;
+                const { imported, skipped, failed } = evt.summary;
+                shopify.toast.show(
+                  `Import finished: ${imported} imported, ${skipped} skipped, ${failed} failed.`,
+                  { isError: Boolean(failed) },
+                );
+              }
+            } else if (evt.type === "error") {
+              setStreamError(evt.message);
+              shopify.toast.show(evt.message, { isError: true });
+            }
+          }
+        }
+      } catch (err) {
+        const message =
+          err instanceof Error ? err.message : "Import request failed.";
+        setStreamError(message);
+        shopify.toast.show(message, { isError: true });
+      } finally {
+        setBusy(false);
+      }
+    },
+    [shopify],
+  );
+
+  const current = progressRows[progressRows.length - 1];
+  const showProgressPanel = busy || progressRows.length > 0 || complete;
 
   return (
     <s-page heading="Order import">
@@ -72,19 +188,19 @@ export default function Index() {
         <s-paragraph>
           Each order is recreated via draft orders (custom line items from
           titles, SKUs, and prices in the CSV). Shipping from the CSV is added
-          as a shipping line when the Shipping total is greater than zero.
-          New orders are completed as{" "}
-          <s-text type="strong">unpaid</s-text> (payment status is not copied
-          from the export).
+          as a shipping line when the Shipping total is greater than zero. New
+          orders are completed as <s-text type="strong">unpaid</s-text>{" "}
+          (payment status is not copied from the export).
         </s-paragraph>
         <s-paragraph>
           The Admin CSV does not include order metafields; for most moves it is
           enough for order records and line items.
         </s-paragraph>
-        <fetcher.Form
+        <form
           method="post"
           action="/app/import-orders"
           encType="multipart/form-data"
+          onSubmit={handleImport}
         >
           <s-stack direction="block" gap="base">
             <input
@@ -103,39 +219,103 @@ export default function Index() {
               Import orders
             </s-button>
           </s-stack>
-        </fetcher.Form>
+        </form>
 
-        {fetcher.data?.summary && (
+        {streamError && !busy && (
+          <s-box padding="base" paddingBlockStart="base">
+            <s-text tone="critical">{streamError}</s-text>
+          </s-box>
+        )}
+
+        {showProgressPanel && (
           <s-box
             padding="base"
+            paddingBlockStart="base"
             borderWidth="base"
             borderRadius="base"
             background="subdued"
           >
             <s-stack direction="block" gap="small">
-              <s-text type="strong">Last run</s-text>
-              <s-paragraph>
-                Total {fetcher.data.summary.total} · Imported{" "}
-                {fetcher.data.summary.imported} · Skipped{" "}
-                {fetcher.data.summary.skipped} · Failed{" "}
-                {fetcher.data.summary.failed}
-              </s-paragraph>
-              {fetcher.data.warning && (
-                <s-paragraph tone="caution">{fetcher.data.warning}</s-paragraph>
+              <s-text type="strong">Import progress</s-text>
+              {busy && current && (
+                <s-paragraph>
+                  Processing{" "}
+                  <s-text type="strong">
+                    {current.index} / {current.total}
+                  </s-text>
+                  …
+                </s-paragraph>
               )}
-              {fetcher.data.results && fetcher.data.results.length > 0 && (
-                <pre
+              {busy && !current && (
+                <s-paragraph>Parsing file and starting import…</s-paragraph>
+              )}
+              {!busy && complete && (
+                <s-paragraph>
+                  Done — total {complete.summary.total} · imported{" "}
+                  {complete.summary.imported} · skipped{" "}
+                  {complete.summary.skipped} · failed {complete.summary.failed}
+                </s-paragraph>
+              )}
+              {progressRows.length > 0 && (
+                <div
                   style={{
-                    margin: 0,
-                    maxHeight: 280,
+                    maxHeight: 320,
                     overflow: "auto",
-                    fontSize: 12,
+                    border: "1px solid var(--p-color-border, #e3e3e3)",
+                    borderRadius: 8,
+                    background: "var(--p-color-bg-surface, #fff)",
                   }}
                 >
-                  <code>
-                    {JSON.stringify(fetcher.data.results, null, 2)}
-                  </code>
-                </pre>
+                  <table
+                    style={{
+                      width: "100%",
+                      borderCollapse: "collapse",
+                      fontSize: 13,
+                    }}
+                  >
+                    <thead>
+                      <tr style={{ textAlign: "left", borderBottom: "1px solid #e3e3e3" }}>
+                        <th style={{ padding: "8px 10px" }}>#</th>
+                        <th style={{ padding: "8px 10px" }}>Status</th>
+                        <th style={{ padding: "8px 10px" }}>Order</th>
+                        <th style={{ padding: "8px 10px" }}>Detail</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {progressRows.map((row) => (
+                        <tr
+                          key={row.index}
+                          style={{ borderBottom: "1px solid #f1f1f1" }}
+                        >
+                          <td style={{ padding: "8px 10px", whiteSpace: "nowrap" }}>
+                            {row.index}/{row.total}
+                          </td>
+                          <td style={{ padding: "8px 10px" }}>
+                            <s-text tone={statusTone(row.result.status)}>
+                              {row.result.status}
+                            </s-text>
+                          </td>
+                          <td style={{ padding: "8px 10px" }}>
+                            {orderRowLabel(row.result, row.index)}
+                          </td>
+                          <td
+                            style={{
+                              padding: "8px 10px",
+                              color: "#6d7175",
+                              maxWidth: 220,
+                              wordBreak: "break-word",
+                            }}
+                          >
+                            {row.result.message ?? "—"}
+                          </td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              )}
+              {complete?.warning && (
+                <s-paragraph tone="caution">{complete.warning}</s-paragraph>
               )}
             </s-stack>
           </s-box>
