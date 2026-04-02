@@ -47,6 +47,8 @@ export type ExportedOrderV1 = {
   displayFulfillmentStatus?: string | null;
   email?: string | null;
   phone?: string | null;
+  /** Numeric or gid from export column "Customer Id" (source store id; may not exist on import store). */
+  customerLegacyResourceId?: string | null;
   note?: string | null;
   tags: string[];
   poNumber?: string | null;

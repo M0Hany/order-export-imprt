@@ -56,10 +56,79 @@ function parseAdminOrderCsvOnly(raw: string): ExportedOrderV1[] {
   return parseShopifyAdminOrdersCsv(trimmed);
 }
 
-async function draftOrderCreate(
+function toCustomerGid(raw: string | null | undefined): string | undefined {
+  const t = raw?.trim();
+  if (!t) return undefined;
+  if (/^gid:\/\/shopify\/Customer\//i.test(t)) return t;
+  const digits = t.replace(/\D/g, "");
+  if (!digits) return undefined;
+  return `gid://shopify/Customer/${digits}`;
+}
+
+async function findCustomerGidByEmail(
+  admin: AdminApiContext,
+  email: string,
+): Promise<string | undefined> {
+  const res = await admin.graphql(
+    `#graphql
+      query CustomerLookupByEmail($q: String!) {
+        customers(first: 1, query: $q) {
+          edges {
+            node {
+              id
+            }
+          }
+        }
+      }
+    `,
+    { variables: { q: `email:${email.trim()}` } },
+  );
+  const json = (await res.json()) as {
+    data?: {
+      customers?: { edges?: { node?: { id: string } }[] };
+    };
+    errors?: { message: string }[];
+  };
+  if (json.errors?.length) return undefined;
+  return json.data?.customers?.edges?.[0]?.node?.id;
+}
+
+/**
+ * Prefer Customer Id from the export (same store). Otherwise resolve by email on this
+ * store (no email is placed on the draft — avoids order confirmation on complete).
+ */
+async function resolveCustomerGidForDraft(
   admin: AdminApiContext,
   order: ExportedOrderV1,
-) {
+): Promise<string | undefined> {
+  const fromExport = toCustomerGid(order.customerLegacyResourceId);
+  if (fromExport) return fromExport;
+
+  const email =
+    order.email?.trim() ||
+    order.customer?.email?.trim() ||
+    undefined;
+  if (!email) return undefined;
+
+  return findCustomerGidByEmail(admin, email);
+}
+
+function shouldRetryDraftWithoutCustomer(userErrorMessage: string): boolean {
+  const m = userErrorMessage.toLowerCase();
+  if (m.includes("purchasing")) return true;
+  if (!m.includes("customer")) return false;
+  return (
+    m.includes("invalid") ||
+    m.includes("not found") ||
+    m.includes("could not") ||
+    m.includes("couldn't") ||
+    m.includes("does not exist") ||
+    m.includes("doesn't exist") ||
+    m.includes("unable to find")
+  );
+}
+
+function buildDraftOrderInput(order: ExportedOrderV1): Record<string, unknown> {
   const lineItems = order.lineItems.map((li) => {
     const unit =
       li.discountedUnitPrice?.amount && li.discountedUnitPrice.currencyCode
@@ -88,7 +157,8 @@ async function draftOrderCreate(
   const tags = order.tags.filter(Boolean);
 
   // Do not set email/phone on the draft: completing the draft would send Shopify's
-  // order confirmation to the customer. Contact is restored via orderUpdate after complete.
+  // order confirmation to the customer. Link customer via purchasingEntity when known.
+  // Email is applied later with orderUpdate.
   const input: Record<string, unknown> = {
     lineItems,
     note: order.note?.trim() || undefined,
@@ -115,6 +185,13 @@ async function draftOrderCreate(
     };
   }
 
+  return input;
+}
+
+async function draftOrderCreateRequest(
+  admin: AdminApiContext,
+  input: Record<string, unknown>,
+): Promise<{ error?: string; draftOrderId?: string }> {
   const res = await admin.graphql(
     `#graphql
       mutation DraftOrderCreate($input: DraftOrderInput!) {
@@ -156,6 +233,28 @@ async function draftOrderCreate(
   const id = payload?.draftOrder?.id;
   if (!id) return { error: "No draft order id returned", draftOrderId: undefined };
   return { draftOrderId: id };
+}
+
+async function draftOrderCreate(
+  admin: AdminApiContext,
+  order: ExportedOrderV1,
+  customerGid?: string,
+) {
+  const baseInput = buildDraftOrderInput(order);
+
+  if (customerGid) {
+    const linked = await draftOrderCreateRequest(admin, {
+      ...baseInput,
+      purchasingEntity: { customerId: customerGid },
+    });
+    if (!linked.error) return linked;
+    if (shouldRetryDraftWithoutCustomer(linked.error)) {
+      return draftOrderCreateRequest(admin, baseInput);
+    }
+    return linked;
+  }
+
+  return draftOrderCreateRequest(admin, baseInput);
 }
 
 async function draftOrderComplete(admin: AdminApiContext, draftOrderId: string) {
@@ -302,7 +401,8 @@ async function importOneOrder(
 
   const hadCsvNote = Boolean(order.note?.trim());
 
-  const created = await draftOrderCreate(admin, order);
+  const customerGid = await resolveCustomerGidForDraft(admin, order);
+  const created = await draftOrderCreate(admin, order, customerGid);
   if (created.error || !created.draftOrderId) {
     return {
       ...base,

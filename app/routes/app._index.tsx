@@ -196,6 +196,15 @@ export default function Index() {
           The Admin CSV does not include order metafields; for most moves it is
           enough for order records and line items.
         </s-paragraph>
+        <s-paragraph>
+          Orders are linked to a matching customer when possible:{" "}
+          <s-text type="strong">Customer Id</s-text> from the export (same
+          store), or the first customer with the same{" "}
+          <s-text type="strong">Email</s-text> on this store. Email is not set on
+          the draft (avoids confirmation emails); it is added right after the
+          order is created. Importing to another store ignores source Customer
+          Ids that do not exist there and falls back to an unlinked order.
+        </s-paragraph>
         <form
           method="post"
           action="/app/import-orders"
@@ -325,8 +334,8 @@ export default function Index() {
       <s-section slot="aside" heading="Notes">
         <s-unordered-list>
           <s-list-item>
-            Reinstall the app if you change OAuth scopes (draft orders are
-            required for import).
+            Reinstall the app if you change OAuth scopes (draft orders and
+            customer read are required for import and customer linking).
           </s-list-item>
           <s-list-item>
             Large CSV/XLSX files are limited to 50 MB per upload in this app.
