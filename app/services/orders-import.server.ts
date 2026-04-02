@@ -53,9 +53,10 @@ async function draftOrderCreate(
   admin: AdminApiContext,
   order: ExportedOrderV1,
 ) {
-  // Do not set draft order email: completing the draft sends an order
-  // confirmation to that address, which confuses customers on migrated imports.
-  // Email from the CSV is ignored here; add or fix it on the order/customer in Admin after import if needed.
+  const email =
+    order.email?.trim() ||
+    order.customer?.email?.trim() ||
+    undefined;
   const phone =
     order.phone?.trim() ||
     order.customer?.phone?.trim() ||
@@ -90,6 +91,7 @@ async function draftOrderCreate(
 
   const input: Record<string, unknown> = {
     lineItems,
+    email,
     phone,
     note: order.note?.trim() || undefined,
     tags,

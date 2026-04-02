@@ -156,12 +156,6 @@ export default function Index() {
             recognize; otherwise leave addresses blank in the CSV or fix them
             after import.
           </s-list-item>
-          <s-list-item>
-            Customer email from the export is not applied to imported orders, so
-            Shopify does not send order confirmation emails. Add or attach the
-            correct email on the order or customer in Admin afterward if you
-            need it on file.
-          </s-list-item>
         </s-unordered-list>
       </s-section>
     </s-page>
