@@ -156,6 +156,13 @@ export default function Index() {
             recognize; otherwise leave addresses blank in the CSV or fix them
             after import.
           </s-list-item>
+          <s-list-item>
+            Discounts: codes from the export are sent to Shopify (they must
+            still exist and be valid). Lineitem discount and compare-at vs price
+            become line discounts when the order has no codes. Order-level
+            Discount Amount is applied only when the export has no discount
+            codes (to avoid doubling with codes).
+          </s-list-item>
         </s-unordered-list>
       </s-section>
     </s-page>

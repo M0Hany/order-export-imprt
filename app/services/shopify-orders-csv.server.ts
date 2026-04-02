@@ -154,12 +154,25 @@ function lineItemFromRow(
   const price = parseDecimal(cell(row, "Lineitem price"));
   if (!title || !price) return null;
 
+  const compareRaw = parseDecimal(cell(row, "Lineitem compare at price"));
+  const lineDiscRaw = parseDecimal(cell(row, "Lineitem discount"));
+  const compareAtUnitPrice =
+    compareRaw && Number(compareRaw) > 0
+      ? { amount: compareRaw, currencyCode }
+      : undefined;
+  const lineDiscountTotal =
+    lineDiscRaw && Number(lineDiscRaw) > 0
+      ? { amount: lineDiscRaw, currencyCode }
+      : undefined;
+
   return {
     title,
     quantity: qty,
     sku: cell(row, "Lineitem sku") || undefined,
     vendor: cell(row, "Vendor") || undefined,
     originalUnitPrice: { amount: price, currencyCode },
+    compareAtUnitPrice,
+    lineDiscountTotal,
     requiresShipping: parseBool(cell(row, "Lineitem requires shipping"), true),
     taxable: parseBool(cell(row, "Lineitem taxable"), true),
   };
@@ -206,6 +219,12 @@ function orderFromGroup(rows: ShopifyOrderRow[]): ExportedOrderV1 {
     ? discount.split(/,\s*/).map((s) => s.trim()).filter(Boolean)
     : [];
 
+  const orderDiscRaw = parseDecimal(cell(base, "Discount Amount"));
+  const orderDiscountAmount =
+    orderDiscRaw && Number(orderDiscRaw) > 0
+      ? { amount: orderDiscRaw, currencyCode }
+      : undefined;
+
   const shippingRaw = parseDecimal(cell(base, "Shipping"));
   const shippingPrice =
     shippingRaw && Number(shippingRaw) > 0
@@ -236,6 +255,7 @@ function orderFromGroup(rows: ShopifyOrderRow[]): ExportedOrderV1 {
     billingAddress,
     lineItems,
     discountCodes,
+    orderDiscountAmount,
     shippingLineTitle: cell(base, "Shipping Method") || "Shipping",
     shippingPrice,
   };

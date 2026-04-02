@@ -1,5 +1,5 @@
 import type { AdminApiContext } from "@shopify/shopify-app-react-router/server";
-import type { ExportedOrderV1 } from "./orders-import.types";
+import type { ExportedLineItemV1, ExportedOrderV1 } from "./orders-import.types";
 import { parseShopifyAdminOrdersCsv } from "./shopify-orders-csv.server";
 import { parseShopifyAdminOrdersXlsx } from "./shopify-orders-xlsx.server";
 import db from "../db.server";
@@ -39,6 +39,108 @@ function toMailingInput(
   return Object.keys(out).length ? out : undefined;
 }
 
+const DRAFT_DISCOUNT_FIXED = "FIXED_AMOUNT";
+
+/** Shopify DraftOrderAppliedDiscountInput: fixed amount using presentment currency. */
+function draftAppliedDiscountFixed(
+  amountStr: string,
+  currencyCode: string,
+  title: string,
+  description?: string,
+): Record<string, unknown> | undefined {
+  const n = Number(amountStr);
+  if (!Number.isFinite(n) || n <= 0) return undefined;
+  const out: Record<string, unknown> = {
+    valueType: DRAFT_DISCOUNT_FIXED,
+    value: n,
+    amountWithCurrency: { amount: amountStr, currencyCode },
+    title,
+  };
+  if (description) out.description = description;
+  return out;
+}
+
+function draftLineItemInput(
+  li: ExportedLineItemV1,
+  orderCurrency: string,
+  orderHasDiscountCodes: boolean,
+): Record<string, unknown> {
+  const qty = li.quantity;
+  const cur = li.originalUnitPrice.currencyCode || orderCurrency;
+  const unitFinalAmt = li.originalUnitPrice.amount;
+  const finalN = Number(unitFinalAmt);
+
+  const lineDisc = li.lineDiscountTotal;
+  const lineDiscN = lineDisc?.amount != null ? Number(lineDisc.amount) : 0;
+
+  const compare = li.compareAtUnitPrice;
+  const compareN = compare?.amount != null ? Number(compare.amount) : NaN;
+
+  let lineDiscountTotalStr: string | undefined;
+
+  if (lineDiscN > 0.0001 && lineDisc?.amount) {
+    lineDiscountTotalStr = lineDisc.amount;
+  } else if (
+    !orderHasDiscountCodes &&
+    Number.isFinite(compareN) &&
+    compareN > finalN + 0.0001 &&
+    compare?.amount
+  ) {
+    lineDiscountTotalStr = ((compareN - finalN) * qty).toFixed(2);
+  }
+
+  const lineDiscInput =
+    lineDiscountTotalStr &&
+    draftAppliedDiscountFixed(
+      lineDiscountTotalStr,
+      cur,
+      "Line discount",
+      "Imported from order export",
+    );
+
+  let unitOriginalAmount = unitFinalAmt;
+  if (lineDiscInput) {
+    if (lineDiscN > 0.0001 && lineDisc?.amount) {
+      unitOriginalAmount = (finalN + lineDiscN / qty).toFixed(2);
+    } else if (compare?.amount) {
+      unitOriginalAmount = compare.amount;
+    }
+  }
+
+  const row: Record<string, unknown> = {
+    quantity: qty,
+    title: li.title,
+    taxable: li.taxable ?? true,
+    requiresShipping: li.requiresShipping ?? true,
+    originalUnitPriceWithCurrency: {
+      amount: unitOriginalAmount,
+      currencyCode: cur,
+    },
+  };
+
+  if (li.sku?.trim()) row.sku = li.sku.trim();
+  if (li.customAttributes?.length) {
+    row.customAttributes = li.customAttributes.map((a) => ({
+      key: a.key,
+      value: a.value,
+    }));
+  }
+
+  if (lineDiscInput) row.appliedDiscount = lineDiscInput;
+  else {
+    const unit =
+      li.discountedUnitPrice?.amount && li.discountedUnitPrice.currencyCode
+        ? li.discountedUnitPrice
+        : li.originalUnitPrice;
+    row.originalUnitPriceWithCurrency = {
+      amount: unit.amount,
+      currencyCode: unit.currencyCode,
+    };
+  }
+
+  return row;
+}
+
 function parseAdminOrderCsvOnly(raw: string): ExportedOrderV1[] {
   const trimmed = raw.trim().replace(/^\uFEFF/, "");
   if (trimmed.startsWith("{")) {
@@ -62,30 +164,11 @@ async function draftOrderCreate(
     order.customer?.phone?.trim() ||
     undefined;
 
-  const lineItems = order.lineItems.map((li) => {
-    const unit =
-      li.discountedUnitPrice?.amount && li.discountedUnitPrice.currencyCode
-        ? li.discountedUnitPrice
-        : li.originalUnitPrice;
-    const row: Record<string, unknown> = {
-      quantity: li.quantity,
-      title: li.title,
-      taxable: li.taxable ?? true,
-      requiresShipping: li.requiresShipping ?? true,
-      originalUnitPriceWithCurrency: {
-        amount: unit.amount,
-        currencyCode: unit.currencyCode,
-      },
-    };
-    if (li.sku?.trim()) row.sku = li.sku.trim();
-    if (li.customAttributes?.length) {
-      row.customAttributes = li.customAttributes.map((a) => ({
-        key: a.key,
-        value: a.value,
-      }));
-    }
-    return row;
-  });
+  const orderCurrency = order.currencyCode || "USD";
+  const hasDiscountCodes = order.discountCodes.length > 0;
+  const lineItems = order.lineItems.map((li) =>
+    draftLineItemInput(li, orderCurrency, hasDiscountCodes),
+  );
 
   const tags = order.tags.filter(Boolean);
 
@@ -101,7 +184,26 @@ async function draftOrderCreate(
     poNumber: order.poNumber || undefined,
     sourceName: "orders-export-import",
     taxExempt: false,
+    acceptAutomaticDiscounts: true,
   };
+
+  if (order.discountCodes.length) {
+    input.discountCodes = order.discountCodes;
+  }
+
+  if (
+    !hasDiscountCodes &&
+    order.orderDiscountAmount?.amount &&
+    order.orderDiscountAmount.currencyCode
+  ) {
+    const od = draftAppliedDiscountFixed(
+      order.orderDiscountAmount.amount,
+      order.orderDiscountAmount.currencyCode,
+      "Order discount",
+      "Imported from order export (Discount Amount)",
+    );
+    if (od) input.appliedDiscount = od;
+  }
 
   if (
     order.shippingPrice &&

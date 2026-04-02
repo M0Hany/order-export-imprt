@@ -26,7 +26,12 @@ export type ExportedLineItemV1 = {
   sku?: string | null;
   variantTitle?: string | null;
   vendor?: string | null;
+  /** Final unit price from export (Lineitem price). */
   originalUnitPrice: ExportedMoneyV1;
+  /** Optional compare-at / list price per unit (Lineitem compare at price). */
+  compareAtUnitPrice?: ExportedMoneyV1 | null;
+  /** Total discount amount for this line from export (Lineitem discount). */
+  lineDiscountTotal?: ExportedMoneyV1 | null;
   discountedUnitPrice?: ExportedMoneyV1 | null;
   requiresShipping?: boolean | null;
   taxable?: boolean | null;
@@ -60,6 +65,8 @@ export type ExportedOrderV1 = {
   billingAddress?: ExportedAddressV1 | null;
   lineItems: ExportedLineItemV1[];
   discountCodes: string[];
+  /** Order-level discount total from export (Discount Amount), excluding code-driven amounts when codes are applied separately. */
+  orderDiscountAmount?: ExportedMoneyV1 | null;
   shippingLineTitle?: string | null;
   shippingPrice?: ExportedMoneyV1 | null;
 };
