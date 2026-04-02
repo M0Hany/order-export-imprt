@@ -53,15 +53,6 @@ async function draftOrderCreate(
   admin: AdminApiContext,
   order: ExportedOrderV1,
 ) {
-  const email =
-    order.email?.trim() ||
-    order.customer?.email?.trim() ||
-    undefined;
-  const phone =
-    order.phone?.trim() ||
-    order.customer?.phone?.trim() ||
-    undefined;
-
   const lineItems = order.lineItems.map((li) => {
     const unit =
       li.discountedUnitPrice?.amount && li.discountedUnitPrice.currencyCode
@@ -89,10 +80,10 @@ async function draftOrderCreate(
 
   const tags = order.tags.filter(Boolean);
 
+  // Do not set email/phone on the draft: completing the draft would send Shopify's
+  // order confirmation to the customer. Contact is restored via orderUpdate after complete.
   const input: Record<string, unknown> = {
     lineItems,
-    email,
-    phone,
     note: order.note?.trim() || undefined,
     tags,
     shippingAddress: toMailingInput(order.shippingAddress),
@@ -214,16 +205,38 @@ async function draftOrderComplete(admin: AdminApiContext, draftOrderId: string) 
 }
 
 /**
- * Shopify often writes payment context (e.g. COD) into the order note when a draft
- * is completed with no merchant note. Clear it when the CSV had no Notes column text.
+ * After import, restore customer email/phone on the order (not on the draft, so no
+ * confirmation email is sent at complete). Optionally clear the auto-filled payment
+ * note when the CSV had no Notes text.
  */
-async function clearAutoOrderNoteIfNoCsvNote(
+async function syncOrderContactAndNoteAfterImport(
   admin: AdminApiContext,
   orderId: string,
+  order: ExportedOrderV1,
+  hadCsvNote: boolean,
 ): Promise<string | null> {
+  const email =
+    order.email?.trim() ||
+    order.customer?.email?.trim() ||
+    undefined;
+  const phone =
+    order.phone?.trim() ||
+    order.customer?.phone?.trim() ||
+    undefined;
+
+  const hasContact = Boolean(email || phone);
+  if (hadCsvNote && !hasContact) {
+    return null;
+  }
+
+  const input: Record<string, unknown> = { id: orderId };
+  if (email) input.email = email;
+  if (phone) input.phone = phone;
+  if (!hadCsvNote) input.note = "";
+
   const res = await admin.graphql(
     `#graphql
-      mutation OrderUpdateClearNote($input: OrderInput!) {
+      mutation OrderUpdateAfterImport($input: OrderInput!) {
         orderUpdate(input: $input) {
           userErrors {
             message
@@ -231,7 +244,7 @@ async function clearAutoOrderNoteIfNoCsvNote(
         }
       }
     `,
-    { variables: { input: { id: orderId, note: "" } } },
+    { variables: { input } },
   );
   const json = (await res.json()) as {
     data?: { orderUpdate?: { userErrors: { message: string }[] } };
@@ -286,10 +299,15 @@ async function importOneOrder(
   }
 
   let extraMessage: string | undefined;
-  if (!hadCsvNote && completed.orderId) {
-    const clearErr = await clearAutoOrderNoteIfNoCsvNote(admin, completed.orderId);
-    if (clearErr) {
-      extraMessage = `Note could not be cleared: ${clearErr}`;
+  if (completed.orderId) {
+    const syncErr = await syncOrderContactAndNoteAfterImport(
+      admin,
+      completed.orderId,
+      order,
+      hadCsvNote,
+    );
+    if (syncErr) {
+      extraMessage = `Post-import order update failed: ${syncErr}`;
     }
   }
 
