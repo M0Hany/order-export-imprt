@@ -38,17 +38,6 @@ function cell(row: ShopifyOrderRow, key: string) {
   return v == null ? "" : String(v).trim();
 }
 
-/** Shopify exports use "Customer Id"; some sheets vary spacing/casing. */
-function customerIdFromRow(row: ShopifyOrderRow): string {
-  const keys = Object.keys(row);
-  const direct = cell(row, "Customer Id") || cell(row, "Customer ID");
-  if (direct) return direct;
-  const match = keys.find(
-    (k) => k.trim().toLowerCase().replace(/\s+/g, " ") === "customer id",
-  );
-  return match ? cell(row, match) : "";
-}
-
 function parseBool(raw: string, fallback: boolean) {
   const t = raw.trim().toLowerCase();
   if (t === "true" || t === "yes") return true;
@@ -223,8 +212,6 @@ function orderFromGroup(rows: ShopifyOrderRow[]): ExportedOrderV1 {
       ? { amount: shippingRaw, currencyCode }
       : undefined;
 
-  const customerIdRaw = customerIdFromRow(base);
-
   return {
     sourceId: id || undefined,
     sourceName: name || undefined,
@@ -233,7 +220,6 @@ function orderFromGroup(rows: ShopifyOrderRow[]): ExportedOrderV1 {
     currencyCode,
     displayFinancialStatus: cell(base, "Financial Status") || undefined,
     displayFulfillmentStatus: cell(base, "Fulfillment Status") || undefined,
-    customerLegacyResourceId: customerIdRaw || undefined,
     email: cell(base, "Email") || undefined,
     phone: phone || undefined,
     note: notesOnly ? notesOnly : undefined,

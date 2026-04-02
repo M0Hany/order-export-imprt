@@ -20,13 +20,6 @@ export type ImportOrdersResult = {
   error?: string;
 };
 
-/** Emitted after each order is processed (1-based index). */
-export type ImportProgressPayload = {
-  index: number;
-  total: number;
-  result: ImportOrderResult;
-};
-
 function toMailingInput(
   addr: NonNullable<ExportedOrderV1["shippingAddress"]> | null | undefined,
 ) {
@@ -56,79 +49,18 @@ function parseAdminOrderCsvOnly(raw: string): ExportedOrderV1[] {
   return parseShopifyAdminOrdersCsv(trimmed);
 }
 
-function toCustomerGid(raw: string | null | undefined): string | undefined {
-  const t = raw?.trim();
-  if (!t) return undefined;
-  if (/^gid:\/\/shopify\/Customer\//i.test(t)) return t;
-  const digits = t.replace(/\D/g, "");
-  if (!digits) return undefined;
-  return `gid://shopify/Customer/${digits}`;
-}
-
-async function findCustomerGidByEmail(
-  admin: AdminApiContext,
-  email: string,
-): Promise<string | undefined> {
-  const res = await admin.graphql(
-    `#graphql
-      query CustomerLookupByEmail($q: String!) {
-        customers(first: 1, query: $q) {
-          edges {
-            node {
-              id
-            }
-          }
-        }
-      }
-    `,
-    { variables: { q: `email:${email.trim()}` } },
-  );
-  const json = (await res.json()) as {
-    data?: {
-      customers?: { edges?: { node?: { id: string } }[] };
-    };
-    errors?: { message: string }[];
-  };
-  if (json.errors?.length) return undefined;
-  return json.data?.customers?.edges?.[0]?.node?.id;
-}
-
-/**
- * Prefer Customer Id from the export (same store). Otherwise resolve by email on this
- * store (no email is placed on the draft — avoids order confirmation on complete).
- */
-async function resolveCustomerGidForDraft(
+async function draftOrderCreate(
   admin: AdminApiContext,
   order: ExportedOrderV1,
-): Promise<string | undefined> {
-  const fromExport = toCustomerGid(order.customerLegacyResourceId);
-  if (fromExport) return fromExport;
-
-  const email =
-    order.email?.trim() ||
-    order.customer?.email?.trim() ||
+) {
+  // Do not set draft order email: completing the draft sends an order
+  // confirmation to that address, which confuses customers on migrated imports.
+  // Email from the CSV is ignored here; add or fix it on the order/customer in Admin after import if needed.
+  const phone =
+    order.phone?.trim() ||
+    order.customer?.phone?.trim() ||
     undefined;
-  if (!email) return undefined;
 
-  return findCustomerGidByEmail(admin, email);
-}
-
-function shouldRetryDraftWithoutCustomer(userErrorMessage: string): boolean {
-  const m = userErrorMessage.toLowerCase();
-  if (m.includes("purchasing")) return true;
-  if (!m.includes("customer")) return false;
-  return (
-    m.includes("invalid") ||
-    m.includes("not found") ||
-    m.includes("could not") ||
-    m.includes("couldn't") ||
-    m.includes("does not exist") ||
-    m.includes("doesn't exist") ||
-    m.includes("unable to find")
-  );
-}
-
-function buildDraftOrderInput(order: ExportedOrderV1): Record<string, unknown> {
   const lineItems = order.lineItems.map((li) => {
     const unit =
       li.discountedUnitPrice?.amount && li.discountedUnitPrice.currencyCode
@@ -156,11 +88,9 @@ function buildDraftOrderInput(order: ExportedOrderV1): Record<string, unknown> {
 
   const tags = order.tags.filter(Boolean);
 
-  // Do not set email/phone on the draft: completing the draft would send Shopify's
-  // order confirmation to the customer. Link customer via purchasingEntity when known.
-  // Email is applied later with orderUpdate.
   const input: Record<string, unknown> = {
     lineItems,
+    phone,
     note: order.note?.trim() || undefined,
     tags,
     shippingAddress: toMailingInput(order.shippingAddress),
@@ -185,13 +115,6 @@ function buildDraftOrderInput(order: ExportedOrderV1): Record<string, unknown> {
     };
   }
 
-  return input;
-}
-
-async function draftOrderCreateRequest(
-  admin: AdminApiContext,
-  input: Record<string, unknown>,
-): Promise<{ error?: string; draftOrderId?: string }> {
   const res = await admin.graphql(
     `#graphql
       mutation DraftOrderCreate($input: DraftOrderInput!) {
@@ -233,28 +156,6 @@ async function draftOrderCreateRequest(
   const id = payload?.draftOrder?.id;
   if (!id) return { error: "No draft order id returned", draftOrderId: undefined };
   return { draftOrderId: id };
-}
-
-async function draftOrderCreate(
-  admin: AdminApiContext,
-  order: ExportedOrderV1,
-  customerGid?: string,
-) {
-  const baseInput = buildDraftOrderInput(order);
-
-  if (customerGid) {
-    const linked = await draftOrderCreateRequest(admin, {
-      ...baseInput,
-      purchasingEntity: { customerId: customerGid },
-    });
-    if (!linked.error) return linked;
-    if (shouldRetryDraftWithoutCustomer(linked.error)) {
-      return draftOrderCreateRequest(admin, baseInput);
-    }
-    return linked;
-  }
-
-  return draftOrderCreateRequest(admin, baseInput);
 }
 
 async function draftOrderComplete(admin: AdminApiContext, draftOrderId: string) {
@@ -311,52 +212,16 @@ async function draftOrderComplete(admin: AdminApiContext, draftOrderId: string) 
 }
 
 /**
- * After import, restore customer email on the order (not on the draft, so no
- * confirmation email is sent at complete). Optionally clear the auto-filled payment
- * note when the CSV had no Notes text.
- *
- * Do not use OrderInput.phone (not accepted on all Admin API versions); put phone on shippingAddress.
+ * Shopify often writes payment context (e.g. COD) into the order note when a draft
+ * is completed with no merchant note. Clear it when the CSV had no Notes column text.
  */
-async function syncOrderContactAndNoteAfterImport(
+async function clearAutoOrderNoteIfNoCsvNote(
   admin: AdminApiContext,
   orderId: string,
-  order: ExportedOrderV1,
-  hadCsvNote: boolean,
 ): Promise<string | null> {
-  const email =
-    order.email?.trim() ||
-    order.customer?.email?.trim() ||
-    undefined;
-  const orderPhone =
-    order.phone?.trim() ||
-    order.customer?.phone?.trim() ||
-    undefined;
-
-  const canSetPhoneOnShipping =
-    Boolean(orderPhone) && Boolean(order.shippingAddress);
-
-  if (hadCsvNote && !email && !canSetPhoneOnShipping) {
-    return null;
-  }
-
-  const input: Record<string, unknown> = { id: orderId };
-  if (email) input.email = email;
-
-  if (canSetPhoneOnShipping && order.shippingAddress) {
-    const merged = {
-      ...order.shippingAddress,
-      phone:
-        order.shippingAddress.phone?.trim() || orderPhone || undefined,
-    };
-    const mailing = toMailingInput(merged);
-    if (mailing) input.shippingAddress = mailing;
-  }
-
-  if (!hadCsvNote) input.note = "";
-
   const res = await admin.graphql(
     `#graphql
-      mutation OrderUpdateAfterImport($input: OrderInput!) {
+      mutation OrderUpdateClearNote($input: OrderInput!) {
         orderUpdate(input: $input) {
           userErrors {
             message
@@ -364,7 +229,7 @@ async function syncOrderContactAndNoteAfterImport(
         }
       }
     `,
-    { variables: { input } },
+    { variables: { input: { id: orderId, note: "" } } },
   );
   const json = (await res.json()) as {
     data?: { orderUpdate?: { userErrors: { message: string }[] } };
@@ -401,8 +266,7 @@ async function importOneOrder(
 
   const hadCsvNote = Boolean(order.note?.trim());
 
-  const customerGid = await resolveCustomerGidForDraft(admin, order);
-  const created = await draftOrderCreate(admin, order, customerGid);
+  const created = await draftOrderCreate(admin, order);
   if (created.error || !created.draftOrderId) {
     return {
       ...base,
@@ -420,15 +284,10 @@ async function importOneOrder(
   }
 
   let extraMessage: string | undefined;
-  if (completed.orderId) {
-    const syncErr = await syncOrderContactAndNoteAfterImport(
-      admin,
-      completed.orderId,
-      order,
-      hadCsvNote,
-    );
-    if (syncErr) {
-      extraMessage = `Post-import order update failed: ${syncErr}`;
+  if (!hadCsvNote && completed.orderId) {
+    const clearErr = await clearAutoOrderNoteIfNoCsvNote(admin, completed.orderId);
+    if (clearErr) {
+      extraMessage = `Note could not be cleared: ${clearErr}`;
     }
   }
 
@@ -467,7 +326,6 @@ export async function importOrdersFromCsv(
   admin: AdminApiContext,
   shop: string,
   raw: string,
-  onProgress?: (payload: ImportProgressPayload) => void,
 ): Promise<ImportOrdersResult> {
   let orders: ExportedOrderV1[];
   try {
@@ -477,14 +335,13 @@ export async function importOrdersFromCsv(
     return { ok: false, results: [], error: message };
   }
 
-  return importParsedOrders(admin, shop, orders, onProgress);
+  return importParsedOrders(admin, shop, orders);
 }
 
 export async function importOrdersFromXlsx(
   admin: AdminApiContext,
   shop: string,
   fileBuffer: ArrayBuffer,
-  onProgress?: (payload: ImportProgressPayload) => void,
 ): Promise<ImportOrdersResult> {
   let orders: ExportedOrderV1[];
   try {
@@ -494,21 +351,18 @@ export async function importOrdersFromXlsx(
     return { ok: false, results: [], error: message };
   }
 
-  return importParsedOrders(admin, shop, orders, onProgress);
+  return importParsedOrders(admin, shop, orders);
 }
 
 async function importParsedOrders(
   admin: AdminApiContext,
   shop: string,
   orders: ExportedOrderV1[],
-  onProgress?: (payload: ImportProgressPayload) => void,
 ): Promise<ImportOrdersResult> {
   const results: ImportOrderResult[] = [];
-  const total = orders.length;
-  for (let i = 0; i < orders.length; i++) {
-    const r = await importOneOrder(admin, shop, orders[i]!);
+  for (const order of orders) {
+    const r = await importOneOrder(admin, shop, order);
     results.push(r);
-    onProgress?.({ index: i + 1, total, result: r });
     await new Promise((r2) => setTimeout(r2, 150));
   }
 
