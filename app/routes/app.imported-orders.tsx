@@ -194,10 +194,42 @@ async function fetchOrdersByPageNumber(admin: AdminApiContext, page: number) {
   };
 }
 
+/** Total orders (same unfiltered list as fetchOrdersPage). Used for ?page=last only. */
+async function fetchOrdersTotalCount(admin: AdminApiContext): Promise<number> {
+  const res = await admin.graphql(
+    `#graphql
+      query OrdersTotalCount {
+        ordersCount(limit: null) {
+          count
+        }
+      }
+    `,
+  );
+  const json = (await res.json()) as {
+    data?: { ordersCount?: { count?: number } | null };
+    errors?: { message: string }[];
+  };
+  if (json.errors?.length) {
+    throw new Error(json.errors.map((e) => e.message).join("; "));
+  }
+  const n = json.data?.ordersCount?.count;
+  return typeof n === "number" && Number.isFinite(n) ? n : 0;
+}
+
 export const loader = async ({ request }: LoaderFunctionArgs) => {
   const { admin, session } = await authenticate.admin(request);
   const url = new URL(request.url);
-  const requestedPage = Math.max(1, Number(url.searchParams.get("page") || "1"));
+  const pageParam = url.searchParams.get("page") ?? "1";
+
+  let requestedPage: number;
+  if (pageParam.toLowerCase() === "last") {
+    const total = await fetchOrdersTotalCount(admin);
+    requestedPage = Math.max(1, Math.ceil(total / PAGE_SIZE));
+  } else {
+    const n = Number(pageParam);
+    requestedPage =
+      Number.isFinite(n) && n >= 1 ? Math.floor(n) : 1;
+  }
 
   const pageResult = await fetchOrdersByPageNumber(admin, requestedPage);
   const remoteOrders = pageResult.nodes;
@@ -532,6 +564,11 @@ export default function ImportedOrdersPage() {
 
         <s-stack direction="inline" gap="base">
           {hasPrevPage ? (
+            <s-link href="/app/imported-orders?page=1">First</s-link>
+          ) : (
+            <s-text>First</s-text>
+          )}
+          {hasPrevPage ? (
             <s-link href={`/app/imported-orders?page=${page - 1}`}>Previous</s-link>
           ) : (
             <s-text>Previous</s-text>
@@ -541,6 +578,11 @@ export default function ImportedOrdersPage() {
             <s-link href={`/app/imported-orders?page=${page + 1}`}>Next</s-link>
           ) : (
             <s-text>Next</s-text>
+          )}
+          {hasNextPage ? (
+            <s-link href="/app/imported-orders?page=last">Last</s-link>
+          ) : (
+            <s-text>Last</s-text>
           )}
         </s-stack>
 
