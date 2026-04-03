@@ -1,5 +1,9 @@
 import type { AdminApiContext } from "@shopify/shopify-app-react-router/server";
-import type { ExportedLineItemV1, ExportedOrderV1 } from "./orders-import.types";
+import type {
+  ExportedAddressV1,
+  ExportedLineItemV1,
+  ExportedOrderV1,
+} from "./orders-import.types";
 import { parseShopifyAdminOrdersCsv } from "./shopify-orders-csv.server";
 import { parseShopifyAdminOrdersXlsx } from "./shopify-orders-xlsx.server";
 import db from "../db.server";
@@ -37,6 +41,179 @@ function toMailingInput(
   if (addr.provinceCode) out.provinceCode = addr.provinceCode;
   if (addr.zip) out.zip = addr.zip;
   return Object.keys(out).length ? out : undefined;
+}
+
+/** Fill missing phone / name on an address from order-level CSV fields. */
+function enrichAddressWithOrderDefaults(
+  addr: ExportedAddressV1 | null | undefined,
+  defaults: {
+    phone?: string;
+    firstName?: string | null;
+    lastName?: string | null;
+  },
+): ExportedAddressV1 | null | undefined {
+  if (!addr) return addr;
+  return {
+    ...addr,
+    phone: addr.phone || defaults.phone,
+    firstName: addr.firstName || defaults.firstName || undefined,
+    lastName: addr.lastName || defaults.lastName || undefined,
+  };
+}
+
+/** E.164-style for Customer APIs (digits, optional leading +). */
+function normalizePhoneForCustomer(phone: string): string {
+  const t = phone.trim().replace(/\s/g, "");
+  if (t.startsWith("+")) {
+    const d = t.slice(1).replace(/\D/g, "");
+    return d ? `+${d}` : "";
+  }
+  const d = t.replace(/\D/g, "");
+  return d ? `+${d}` : "";
+}
+
+async function findCustomerIdByQuery(
+  admin: AdminApiContext,
+  query: string,
+): Promise<string | undefined> {
+  const res = await admin.graphql(
+    `#graphql
+      query FindCustomers($query: String!) {
+        customers(first: 5, query: $query) {
+          edges {
+            node {
+              id
+            }
+          }
+        }
+      }
+    `,
+    { variables: { query } },
+  );
+  const json = (await res.json()) as {
+    data?: { customers?: { edges?: { node?: { id: string } }[] } };
+    errors?: { message: string }[];
+  };
+  if (json.errors?.length) return undefined;
+  return json.data?.customers?.edges?.[0]?.node?.id;
+}
+
+async function customerCreateForImport(
+  admin: AdminApiContext,
+  input: Record<string, unknown>,
+): Promise<string | undefined> {
+  const res = await admin.graphql(
+    `#graphql
+      mutation CustomerCreate($input: CustomerInput!) {
+        customerCreate(input: $input) {
+          customer {
+            id
+          }
+          userErrors {
+            message
+          }
+        }
+      }
+    `,
+    { variables: { input } },
+  );
+  const json = (await res.json()) as {
+    data?: {
+      customerCreate?: {
+        customer?: { id: string } | null;
+        userErrors: { message: string }[];
+      };
+    };
+    errors?: { message: string }[];
+  };
+  if (json.errors?.length) return undefined;
+  const id = json.data?.customerCreate?.customer?.id;
+  if (id) return id;
+  return undefined;
+}
+
+/**
+ * Attach draft to a Customer (Admin "customer" card). Matches Shopify: email customers
+ * and phone-only customers (no email on profile).
+ */
+async function findOrCreateCustomerForImport(
+  admin: AdminApiContext,
+  order: ExportedOrderV1,
+): Promise<string | undefined> {
+  const email =
+    order.email?.trim() || order.customer?.email?.trim() || undefined;
+
+  const phoneRaw =
+    order.phone?.trim() ||
+    order.customer?.phone?.trim() ||
+    order.billingAddress?.phone?.trim() ||
+    order.shippingAddress?.phone?.trim() ||
+    undefined;
+  const phoneCanon = phoneRaw ? normalizePhoneForCustomer(phoneRaw) : "";
+
+  const cust = order.customer;
+  const bill = order.billingAddress;
+  const ship = order.shippingAddress;
+  const firstName =
+    cust?.firstName?.trim() ||
+    bill?.firstName?.trim() ||
+    ship?.firstName?.trim() ||
+    undefined;
+  const lastName =
+    cust?.lastName?.trim() ||
+    bill?.lastName?.trim() ||
+    ship?.lastName?.trim() ||
+    undefined;
+
+  if (email) {
+    const q = `email:"${email.replace(/"/g, "")}"`;
+    let id = await findCustomerIdByQuery(admin, q);
+    if (id) return id;
+
+    const createInput: Record<string, unknown> = { email };
+    if (phoneCanon) createInput.phone = phoneCanon;
+    if (firstName) createInput.firstName = firstName;
+    if (lastName) createInput.lastName = lastName;
+
+    id = await customerCreateForImport(admin, createInput);
+    if (id) return id;
+
+    id = await findCustomerIdByQuery(admin, q);
+    if (id) return id;
+
+    if (phoneCanon) {
+      id = await customerCreateForImport(admin, { email });
+      if (id) return id;
+      id = await findCustomerIdByQuery(admin, q);
+      if (id) return id;
+    }
+    return undefined;
+  }
+
+  if (phoneCanon.length >= 8) {
+    const queries = [
+      `phone:${phoneCanon}`,
+      `phone:"${phoneCanon}"`,
+    ];
+    for (const query of queries) {
+      const id = await findCustomerIdByQuery(admin, query);
+      if (id) return id;
+    }
+
+    const createInput: Record<string, unknown> = { phone: phoneCanon };
+    if (firstName) createInput.firstName = firstName;
+    if (lastName) createInput.lastName = lastName;
+
+    let id = await customerCreateForImport(admin, createInput);
+    if (id) return id;
+
+    for (const query of queries) {
+      id = await findCustomerIdByQuery(admin, query);
+      if (id) return id;
+    }
+  }
+
+  return undefined;
 }
 
 const DRAFT_DISCOUNT_FIXED = "FIXED_AMOUNT";
@@ -101,7 +278,9 @@ function draftLineItemInput(
   let unitOriginalAmount = unitFinalAmt;
   if (lineDiscInput) {
     if (lineDiscN > 0.0001 && lineDisc?.amount) {
-      unitOriginalAmount = (finalN + lineDiscN / qty).toFixed(2);
+      // CSV "Lineitem discount" is treated as an amount at the same unit scale
+      // as "Lineitem price" (no per-quantity division).
+      unitOriginalAmount = (finalN + lineDiscN).toFixed(2);
     } else if (compare?.amount) {
       unitOriginalAmount = compare.amount;
     }
@@ -164,6 +343,23 @@ async function draftOrderCreate(
     order.customer?.phone?.trim() ||
     undefined;
 
+  const bill = order.billingAddress;
+  const ship = order.shippingAddress;
+  const cust = order.customer;
+
+  const shippingEnriched = enrichAddressWithOrderDefaults(ship, {
+    phone,
+    firstName: ship?.firstName || bill?.firstName || cust?.firstName,
+    lastName: ship?.lastName || bill?.lastName || cust?.lastName,
+  });
+  const billingEnriched = enrichAddressWithOrderDefaults(bill ?? ship, {
+    phone,
+    firstName: bill?.firstName || cust?.firstName || ship?.firstName,
+    lastName: bill?.lastName || cust?.lastName || ship?.lastName,
+  });
+
+  const customerId = await findOrCreateCustomerForImport(admin, order);
+
   const orderCurrency = order.currencyCode || "USD";
   const hasDiscountCodes = order.discountCodes.length > 0;
   const lineItems = order.lineItems.map((li) =>
@@ -178,14 +374,19 @@ async function draftOrderCreate(
     phone,
     note: order.note?.trim() || undefined,
     tags,
-    shippingAddress: toMailingInput(order.shippingAddress),
-    billingAddress: toMailingInput(order.billingAddress ?? order.shippingAddress),
+    shippingAddress: toMailingInput(shippingEnriched),
+    billingAddress: toMailingInput(billingEnriched ?? shippingEnriched),
     presentmentCurrencyCode: order.currencyCode || undefined,
     poNumber: order.poNumber || undefined,
     sourceName: "orders-export-import",
     taxExempt: false,
     acceptAutomaticDiscounts: true,
   };
+
+  if (customerId) {
+    input.purchasingEntity = { customerId };
+    input.useCustomerDefaultAddress = false;
+  }
 
   if (order.discountCodes.length) {
     input.discountCodes = order.discountCodes;

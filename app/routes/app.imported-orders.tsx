@@ -194,6 +194,60 @@ async function fetchOrdersByPageNumber(admin: AdminApiContext, page: number) {
   };
 }
 
+function parseOrderNumbersRaw(raw: string): string[] {
+  const tokens = raw
+    .split(/[\s,]+/g)
+    .map((t) => t.trim())
+    .filter(Boolean)
+    .map((t) => (t.startsWith("#") ? t.slice(1) : t));
+
+  // Shopify "order name" is usually numeric (displayed like "#1283").
+  // To avoid search syntax issues, keep digits-only.
+  return [...new Set(tokens.filter((t) => /^\d+$/.test(t)))];
+}
+
+async function findImportedOrderIdsByNumbers(
+  admin: AdminApiContext,
+  numbers: string[],
+): Promise<{ orderGids: string[]; notFound: string[] }> {
+  const orderGids: string[] = [];
+  const notFound: string[] = [];
+
+  for (const n of numbers) {
+    const res = await admin.graphql(
+      `#graphql
+        query OrdersByName($query: String!) {
+          orders(first: 5, query: $query) {
+            nodes {
+              id
+            }
+          }
+        }
+      `,
+      {
+        variables: {
+          query: `source_name:orders-export-import name:${n}`,
+        },
+      },
+    );
+
+    const json = (await res.json()) as {
+      data?: { orders?: { nodes?: { id: string }[] } };
+      errors?: { message: string }[];
+    };
+
+    if (json.errors?.length) {
+      throw new Error(json.errors.map((e) => e.message).join("; "));
+    }
+
+    const id = json.data?.orders?.nodes?.[0]?.id;
+    if (id) orderGids.push(id);
+    else notFound.push(n);
+  }
+
+  return { orderGids: [...new Set(orderGids)], notFound };
+}
+
 /** Total orders (same unfiltered list as fetchOrdersPage). Used for ?page=last only. */
 async function fetchOrdersTotalCount(admin: AdminApiContext): Promise<number> {
   const res = await admin.graphql(
@@ -272,7 +326,7 @@ export const action = async ({ request }: ActionFunctionArgs) => {
   const intent = String(form.get("intent") || "");
 
   let targets: { id: string; orderGid: string }[] = [];
-  const preDeletionErrors: string[] = [];
+  let preErrors: string[] = [];
   if (intent === "delete-all") {
     targets = await db.importedOrder.findMany({
       where: { shop: session.shop },
@@ -298,6 +352,40 @@ export const action = async ({ request }: ActionFunctionArgs) => {
     }
 
     targets = [...new Set(orderGids)].map((orderGid) => ({ id: orderGid, orderGid }));
+  } else if (intent === "delete-by-order-numbers") {
+    const raw = String(form.get("orderNumbersRaw") || "");
+    const orderNumbers = parseOrderNumbersRaw(raw);
+
+    if (!orderNumbers.length) {
+      return data<ActionResult>(
+        {
+          ok: false,
+          deleted: 0,
+          errors: [
+            "Paste order numbers like #1283 (comma/space/newline separated).",
+          ],
+        },
+        { status: 400 },
+      );
+    }
+
+    const { orderGids, notFound } = await findImportedOrderIdsByNumbers(
+      admin,
+      orderNumbers,
+    );
+
+    preErrors = notFound.map(
+      (n) => `Order #${n} not found in imported orders.`,
+    );
+
+    if (!orderGids.length) {
+      return data<ActionResult>(
+        { ok: false, deleted: 0, errors: preErrors, deletedOrderGids: [] },
+        { status: 404 },
+      );
+    }
+
+    targets = orderGids.map((orderGid) => ({ id: orderGid, orderGid }));
   } else if (intent === "delete-by-source") {
     try {
       const remoteIds = await listImportedOrderGidsFromShopify(admin);
@@ -308,82 +396,6 @@ export const action = async ({ request }: ActionFunctionArgs) => {
         { ok: false, deleted: 0, errors: [message] },
         { status: 500 },
       );
-    }
-  } else if (intent === "delete-by-order-numbers") {
-    const orderNumbersText = String(form.get("orderNumbersText") || "");
-    const tokens = orderNumbersText
-      .split(/[\s,]+/)
-      .map((t) => t.trim())
-      .filter(Boolean)
-      .map((t) => t.replace(/^#/, ""))
-      .filter(Boolean);
-
-    if (!tokens.length) {
-      return data<ActionResult>(
-        { ok: false, deleted: 0, errors: ["Paste one or more order numbers."] },
-        { status: 400 },
-      );
-    }
-
-    const uniqueTokens = [...new Set(tokens)];
-    const foundOrderGids: string[] = [];
-    const missingOrderNumbers: string[] = [];
-
-    // Resolve each order number into a Shopify Order GID.
-    // We use `name:` search syntax (Shopify order names are usually the number without '#').
-    for (const orderNumber of uniqueTokens) {
-      const res = await admin.graphql(
-        `#graphql
-          query OrdersByName($q: String!) {
-            orders(first: 5, query: $q) {
-              nodes {
-                id
-                name
-              }
-            }
-          }
-        `,
-        { variables: { q: `name:${orderNumber}` } },
-      );
-
-      const json = (await res.json()) as {
-        data?: { orders?: { nodes?: { id?: string | null }[] | null } };
-        errors?: { message: string }[];
-      };
-
-      if (json.errors?.length) {
-        return data<ActionResult>(
-          { ok: false, deleted: 0, errors: json.errors.map((e) => e.message) },
-          { status: 500 },
-        );
-      }
-
-      const id = json.data?.orders?.nodes?.[0]?.id;
-      if (id) foundOrderGids.push(String(id));
-      else missingOrderNumbers.push(orderNumber);
-    }
-
-    if (!foundOrderGids.length) {
-      return data<ActionResult>(
-        {
-          ok: false,
-          deleted: 0,
-          errors: [
-            "No matching Shopify orders found for the provided order numbers.",
-          ],
-        },
-        { status: 400 },
-      );
-    }
-
-    targets = [...new Set(foundOrderGids)].map((orderGid) => ({
-      id: orderGid,
-      orderGid,
-    }));
-
-    // We'll attach missing entries to the final returned errors (but still delete the found ones).
-    for (const n of missingOrderNumbers) {
-      preDeletionErrors.push(`Order number not found: #${n}`);
     }
   } else if (intent === "list-all-order-ids") {
     try {
@@ -419,9 +431,8 @@ export const action = async ({ request }: ActionFunctionArgs) => {
   }
 
   let deleted = 0;
-  const errors: string[] = [];
+  const errors: string[] = [...preErrors];
   const deletedOrderGids: string[] = [];
-  errors.push(...preDeletionErrors);
 
   for (const t of targets) {
     const result = await deleteOrderByGid(admin, t.orderGid);
@@ -461,7 +472,7 @@ export default function ImportedOrdersPage() {
   const hasRows = importedOrders.length > 0;
 
   const [selected, setSelected] = useState<Set<string>>(new Set());
-  const [orderNumbersText, setOrderNumbersText] = useState<string>("");
+  const [orderNumbersRaw, setOrderNumbersRaw] = useState<string>("");
   const storageKey = "orders-export-import:selected-order-gids";
 
   useEffect(() => {
@@ -544,7 +555,7 @@ export default function ImportedOrdersPage() {
   const submitDeleteByOrderNumbers = () => {
     const fd = new FormData();
     fd.set("intent", "delete-by-order-numbers");
-    fd.set("orderNumbersText", orderNumbersText);
+    fd.set("orderNumbersRaw", orderNumbersRaw);
     deleteFetcher.submit(fd, { method: "post" });
   };
 
@@ -562,41 +573,49 @@ export default function ImportedOrdersPage() {
           Select any orders from your store and delete them in bulk from Shopify.
         </s-paragraph>
         <s-paragraph>
+          Bulk delete by order number (order name): paste values like{" "}
+          <code>#1283</code> separated by commas, spaces, or new lines.
+        </s-paragraph>
+        <div
+          style={{
+            display: "flex",
+            gap: 12,
+            alignItems: "flex-start",
+            marginTop: 6,
+            marginBottom: 6,
+          }}
+        >
+          <textarea
+            value={orderNumbersRaw}
+            onChange={(e) => setOrderNumbersRaw(e.currentTarget.value)}
+            placeholder="#1283, #1284"
+            style={{
+              width: 340,
+              height: 64,
+              resize: "vertical",
+              padding: 8,
+              fontSize: 13,
+              borderRadius: 6,
+              border: "1px solid var(--p-border-subdued, #dfe3e8)",
+            }}
+            disabled={deleting}
+          />
+          <s-button
+            variant="primary"
+            type="button"
+            onClick={submitDeleteByOrderNumbers}
+            disabled={deleting || !orderNumbersRaw.trim()}
+            {...(deleting ? { loading: true } : {})}
+          >
+            Delete by numbers
+          </s-button>
+        </div>
+        <s-paragraph>
           Selected across all pages: <s-text type="strong">{selectedCount}</s-text>
         </s-paragraph>
         <s-paragraph>
           Selected on this page: <s-text type="strong">{selectedOnPageCount}</s-text>
         </s-paragraph>
-
-        <s-stack direction="inline" gap="base" style={{ marginTop: 12 }}>
-          <div style={{ flex: 1 }}>
-            <s-paragraph>
-              Bulk delete by order number (ex: <code>#1283</code>).
-            </s-paragraph>
-            <textarea
-              value={orderNumbersText}
-              onChange={(e) => setOrderNumbersText(e.currentTarget.value)}
-              placeholder="Paste numbers separated by commas or new lines"
-              style={{
-                width: "100%",
-                minHeight: 72,
-                resize: "vertical",
-                padding: 8,
-                fontSize: 13,
-              }}
-              disabled={deleting}
-            />
-          </div>
-          <s-button
-            type="button"
-            variant="primary"
-            onClick={submitDeleteByOrderNumbers}
-            disabled={deleting || !orderNumbersText.trim()}
-            {...(deleting ? { loading: true } : {})}
-          >
-            Delete by numbers
-          </s-button>
-        </s-stack>
 
         <s-stack direction="inline" gap="base">
           <s-button

@@ -244,13 +244,16 @@ function orderFromGroup(rows: ShopifyOrderRow[]): ExportedOrderV1 {
     note: notesOnly ? notesOnly : undefined,
     tags: parseTags(cell(base, "Tags")),
     poNumber: cell(base, "Receipt Number") || undefined,
-    customer: cell(base, "Email")
-      ? {
-          email: cell(base, "Email"),
-          phone,
-          ...splitPersonName(cell(base, "Billing Name")),
-        }
-      : null,
+    customer: (() => {
+      const billingSplit = splitPersonName(cell(base, "Billing Name"));
+      const em = cell(base, "Email");
+      if (!em && !billingSplit.firstName && !phone) return null;
+      return {
+        ...(em ? { email: em } : {}),
+        phone,
+        ...billingSplit,
+      };
+    })(),
     shippingAddress,
     billingAddress,
     lineItems,
